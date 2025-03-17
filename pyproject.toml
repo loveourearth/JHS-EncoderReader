@@ -1,0 +1,31 @@
+[project]
+name = "jhs-encoderreader"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "D0",email = "r17927@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial (>=3.5,<4.0)",
+    "rpi-gpio (>=0.7.1,<0.8.0)",
+    "pymodbus (>=3.8.6,<4.0.0)",
+    "python-osc (>=1.9.3,<2.0.0)",
+    "psutil (>=7.0.0,<8.0.0)",
+    "asyncio (>=3.4.3,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+black = "^25.1.0"
+pytest = "^8.3.5"
+isort = "^6.0.1"
+flake8 = "^7.1.2"
+pytest-cov = "^6.0.0"
+mypy = "^1.15.0"
+

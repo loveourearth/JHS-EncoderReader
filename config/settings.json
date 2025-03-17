@@ -1,0 +1,46 @@
+{
+    "serial": {
+        "port": "/dev/ttyUSB0",
+        "baudrate": 9600,
+        "bytesize": 8,
+        "parity": "N",
+        "stopbits": 1,
+        "timeout": 0.5
+    },
+    "modbus": {
+        "slave_address": 1,
+        "auto_response_time": 50,
+        "simulation_mode": false,
+        "debug_mode": true
+    },
+    "gpio": {
+        "output_pins": [17, 27, 22],
+        "input_pin": 18,
+        "enable_event_detect": false
+    },
+    "encoder": {
+        "resolution": 4096,
+        "sampling_time_ms": 100
+    },
+    "osc": {
+        "host": "0.0.0.0",
+        "port": 8888,
+        "return_port": 9999,
+        "enabled": true,
+        "default_format": "osc"
+    },
+    "logging": {
+        "level": "INFO",
+        "file_enabled": true,
+        "file_path": "encoder_system.log",
+        "max_size_mb": 10,
+        "backup_count": 5
+    },
+    "system": {
+        "max_retries": 3,
+        "retry_interval": 5,
+        "auto_reconnect": true,
+        "health_check_interval": 30,
+        "logging_interval": 300
+    }
+}
