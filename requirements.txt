@@ -1,0 +1,7 @@
+# Core dependencies
+python-osc>=1.8.0
+pyserial>=3.5
+pymodbus>=3.0.0
+
+# Optional dependencies (for Raspberry Pi hardware)
+# RPi.GPIO>=0.7.0  # Uncomment when deploying on Raspberry Pi
