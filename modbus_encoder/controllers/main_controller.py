@@ -47,6 +47,10 @@ class MainController:
         self.error_count = 0
         self.last_error = ""
 
+        # 命令歷史記錄
+        self.command_history = []
+        self.max_history_size = 100
+
     def initialize(self) -> bool:
         """初始化系統
 
@@ -54,6 +58,7 @@ class MainController:
             是否成功初始化
         """
         try:
+            logger.info("開始初始化系統...")
             # 初始化編碼器控制器
             encoder_success = self.initialize_encoder()
 
@@ -88,6 +93,7 @@ class MainController:
             是否成功初始化
         """
         try:
+            logger.info("正在初始化編碼器控制器...")
             # 創建編碼器控制器
             self.encoder_controller = EncoderController()
 
@@ -100,6 +106,10 @@ class MainController:
                 "on_connection_lost", self._on_encoder_connection_lost)
             self.encoder_controller.register_event_listener(
                 "on_connection_restored", self._on_encoder_connection_restored)
+            self.encoder_controller.register_event_listener(
+                "on_monitoring_started", self._on_monitoring_started)
+            self.encoder_controller.register_event_listener(
+                "on_monitoring_stopped", self._on_monitoring_stopped)
 
             # 從配置讀取連接參數
             serial_config = self.config_manager.get_serial_config()
@@ -132,6 +142,7 @@ class MainController:
             是否成功初始化
         """
         try:
+            logger.info("正在初始化GPIO控制器...")
             # 從配置讀取GPIO參數
             gpio_config = self.config_manager.get_gpio_config()
 
@@ -166,6 +177,7 @@ class MainController:
             是否成功初始化
         """
         try:
+            logger.info("正在初始化OSC服務器...")
             # 從配置讀取OSC參數
             osc_config = self.config_manager.get_osc_config()
 
@@ -179,7 +191,7 @@ class MainController:
                 host=osc_config.get('host', '0.0.0.0'),
                 port=osc_config.get('port', 8888),
                 command_handler=self.handle_command,
-                return_port=osc_config.get('return_port', 9999)  # 添加此行
+                return_port=osc_config.get('return_port', 9999)
             )
 
             # 啟動服務器
@@ -250,9 +262,11 @@ class MainController:
         if self.encoder_controller:
             try:
                 logger.info("正在關閉編碼器控制器...")
-                # 先確保停止監測
+                # 移除所有事件監聽器
+                self.encoder_controller.clear_event_listeners()
+                # 停止監測
                 self.encoder_controller.stop_monitoring()
-                # 然後斷開連接
+                # 斷開連接
                 self.encoder_controller.disconnect()
                 logger.info("編碼器控制器已關閉")
             except Exception as e:
@@ -286,13 +300,14 @@ class MainController:
         Returns:
             處理結果
         """
+        start_time = time.time()
+
         # 解析命令
         if isinstance(command, str):
             try:
                 command = json.loads(command)
             except json.JSONDecodeError:
-                # 這裡的問題在於沒有正確處理帶參數的命令
-                # 改為以下代碼：
+                # 解析帶參數的命令
                 parts = command.split(None, 1)  # 分割命令和參數
                 cmd_name = parts[0] if parts else ""
                 params_str = parts[1] if len(parts) > 1 else ""
@@ -321,6 +336,9 @@ class MainController:
         # 記錄命令
         logger.info(f"處理命令: {cmd}, 來源: {source}")
 
+        # 添加到命令歷史
+        self._add_to_command_history(cmd, source)
+
         # 系統命令
         if cmd == "status":
             return self.get_status()
@@ -330,6 +348,8 @@ class MainController:
             return self._handle_disconnect(command, source)
         elif cmd == "reset":
             return self._handle_reset(command, source)
+        elif cmd == "get_history":
+            return self._handle_get_history(command, source)
 
         # 編碼器命令
         if cmd.startswith("read_") or cmd == "set_zero":
@@ -369,9 +389,55 @@ class MainController:
             elif cmd == "read_input":
                 return self._handle_read_input(command, source)
 
+        # 記錄命令處理時間
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 0.1:  # 當處理時間超過100ms時記錄
+            logger.debug(f"命令 {cmd} 處理時間: {elapsed_time:.3f}秒")
+
         # 未知命令
         logger.warning(f"未知命令: {cmd}")
         return {"status": "error", "message": f"未知命令: {cmd}"}
+
+    def _add_to_command_history(self, cmd: str, source: Any) -> None:
+        """添加命令到歷史記錄
+
+        Args:
+            cmd: 命令名稱
+            source: 命令來源
+        """
+        # 僅在非系統命令時記錄
+        if source != "SYSTEM":
+            history_entry = {
+                "command": cmd,
+                "source": str(source),
+                "timestamp": time.time()
+            }
+
+            # 添加到歷史記錄
+            self.command_history.append(history_entry)
+
+            # 保持歷史記錄大小
+            if len(self.command_history) > self.max_history_size:
+                self.command_history = self.command_history[-self.max_history_size:]
+
+    def _handle_get_history(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
+        """處理獲取命令歷史記錄
+
+        Args:
+            params: 命令參數
+            source: 命令來源
+
+        Returns:
+            處理結果
+        """
+        limit = int(params.get("limit", 10))
+        history = self.command_history[-limit:] if limit > 0 else []
+
+        return {
+            "status": "success",
+            "count": len(history),
+            "history": history
+        }
 
     def get_status(self) -> Dict[str, Any]:
         """獲取系統狀態
@@ -433,6 +499,14 @@ class MainController:
 
         status["continuous_tasks"] = continuous_tasks
 
+        # 命令歷史統計
+        if self.command_history:
+            status["command_history"] = {
+                "count": len(self.command_history),
+                "last_command": self.command_history[-1]["command"],
+                "last_timestamp": self.command_history[-1]["timestamp"]
+            }
+
         return {"status": "success", "info": status}
 
     def _handle_reset(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
@@ -446,16 +520,39 @@ class MainController:
             處理結果
         """
         try:
-            # 關閉系統
-            self.shutdown()
+            logger.info("接收到系統重置命令")
+            hard_reset = params.get("hard", False)
 
-            # 重新初始化系統
-            success = self.initialize()
+            if hard_reset:
+                logger.info("執行硬重置 - 完全關閉並重新初始化所有系統")
+                # 關閉系統
+                self.shutdown()
+
+                # 重新初始化系統
+                success = self.initialize()
+            else:
+                logger.info("執行軟重置 - 保持連接並重置狀態")
+                # 只重置錯誤計數和重新建立通訊
+                self.error_count = 0
+                self.last_error = ""
+
+                # 重新連接編碼器（如有必要）
+                if self.encoder_controller and not self.encoder_controller.connected:
+                    serial_config = self.config_manager.get_serial_config()
+                    modbus_config = self.config_manager.get_modbus_config()
+                    self.encoder_controller.connect(
+                        port=serial_config.get('port', '/dev/ttyUSB0'),
+                        baudrate=serial_config.get('baudrate', 9600),
+                        address=modbus_config.get('slave_address', 1)
+                    )
+
+                # 標記為成功
+                success = True
 
             if success:
                 return {
                     "status": "success",
-                    "message": "系統已成功重置"
+                    "message": f"系統已成功{'硬' if hard_reset else '軟'}重置"
                 }
             else:
                 return {
@@ -495,21 +592,49 @@ class MainController:
                 "on_connection_lost", self._on_encoder_connection_lost)
             self.encoder_controller.register_event_listener(
                 "on_connection_restored", self._on_encoder_connection_restored)
+            self.encoder_controller.register_event_listener(
+                "on_monitoring_started", self._on_monitoring_started)
+            self.encoder_controller.register_event_listener(
+                "on_monitoring_stopped", self._on_monitoring_stopped)
 
-        port = params.get("port", "/dev/ttyUSB0")
-        baudrate = params.get("baudrate", 9600)
-        address = params.get("address", 1)
+        # 從參數獲取連接設置，如果沒有則從配置讀取
+        serial_config = self.config_manager.get_serial_config()
+        modbus_config = self.config_manager.get_modbus_config()
 
-        success = self.encoder_controller.connect(port, baudrate, address)
+        port = params.get("port", serial_config.get('port', '/dev/ttyUSB0'))
+        baudrate = params.get("baudrate", serial_config.get('baudrate', 9600))
+        address = params.get("address", modbus_config.get('slave_address', 1))
+
+        # 添加重試選項
+        retry = int(params.get("retry", 1))
+
+        # 帶重試的連接
+        success = False
+        error_message = "連接失敗，未知錯誤"
+
+        for attempt in range(retry):
+            try:
+                logger.info(f"嘗試連接編碼器 (嘗試 {attempt+1}/{retry})")
+                success = self.encoder_controller.connect(
+                    port, baudrate, address)
+
+                if success:
+                    break
+
+                if attempt < retry - 1:
+                    time.sleep(1)  # 在重試前等待
+            except Exception as e:
+                error_message = str(e)
+                logger.warning(f"連接嘗試 {attempt+1} 失敗: {e}")
+                if attempt < retry - 1:
+                    time.sleep(1)
 
         if success:
             # 更新配置
-            serial_config = self.config_manager.get_serial_config()
             serial_config['port'] = port
             serial_config['baudrate'] = baudrate
             self.config_manager.set_serial_config(serial_config)
 
-            modbus_config = self.config_manager.get_modbus_config()
             modbus_config['slave_address'] = address
             self.config_manager.set_modbus_config(modbus_config)
 
@@ -523,7 +648,7 @@ class MainController:
         else:
             return {
                 "status": "error",
-                "message": "連接編碼器失敗，請確認設備已正確連接並已開啟電源"
+                "message": f"連接編碼器失敗: {error_message}"
             }
 
     def _handle_disconnect(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
@@ -1098,6 +1223,45 @@ class MainController:
             "tasks": tasks
         }
 
+    def _on_monitoring_started(self, data: Dict[str, Any]) -> None:
+        """監測啟動事件處理器
+
+        Args:
+            data: 事件數據
+        """
+        if not self.osc_server:
+            return
+
+        event_data = {
+            "status": "success",
+            "type": "monitor_start",
+            "interval": data.get("interval", 0.5),
+            "timestamp": time.time(),
+            "message": "監測已啟動"
+        }
+
+        # 廣播到所有客戶端
+        self.osc_server.broadcast("/encoder/monitor", event_data)
+
+    def _on_monitoring_stopped(self, data: Any) -> None:
+        """監測停止事件處理器
+
+        Args:
+            data: 事件數據
+        """
+        if not self.osc_server:
+            return
+
+        event_data = {
+            "status": "success",
+            "type": "monitor_stop",
+            "timestamp": time.time(),
+            "message": "監測已停止"
+        }
+
+        # 廣播到所有客戶端
+        self.osc_server.broadcast("/encoder/monitor", event_data)
+
     def _trigger_monitor_event(self, task_id: str, interval: float, format_type: str) -> None:
         """觸發監測啟動事件"""
         if not self.osc_server:
@@ -1203,16 +1367,20 @@ class MainController:
                     ]
                 else:
                     # 文本格式: <addr>,<timestamp>,<dir>,<angle>,<rpm>,<laps>,<raw_angle>,<raw_rpm>
-                    # Check if rpm or raw_rpm is None and provide default values
+                    # 使用默認值處理缺失或None值
                     rpm_value = data['rpm'] if data['rpm'] is not None else 0
                     raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
 
                     result = f"{data['address']},{data['timestamp']:.3f},{data['direction']},{data['angle']:.4f},{rpm_value:.4f},{data['laps']},{data['raw_angle']},{raw_rpm_value}\n"
 
-                # 發送資料
-                if source:
-                    # 廣播到所有客户端
-                    self.osc_server.broadcast("/encoder/monitor_data", result)
+                try:
+                    # 發送資料
+                    if source:
+                        # 廣播到所有客户端
+                        self.osc_server.broadcast(
+                            "/encoder/monitor_data", result)
+                except Exception as e:
+                    logger.error(f"發送監測資料出錯: {e}")
 
     def _on_encoder_zero_set(self, data: Dict[str, Any]) -> None:
         """編碼器零點設置事件處理器
@@ -1353,9 +1521,12 @@ class MainController:
 
         # 使用 broadcast 發送
         if self.osc_server:
-            address = "/gpio/response" if result.get(
-                "status") == "success" else "/gpio/error"
-            self.osc_server.broadcast(address, result)
+            try:
+                address = "/gpio/response" if result.get(
+                    "status") == "success" else "/gpio/error"
+                self.osc_server.broadcast(address, result)
+            except Exception as e:
+                logger.error(f"發送GPIO響應出錯: {e}")
 
         return result
 
@@ -1375,7 +1546,10 @@ class MainController:
 
         # 使用 broadcast 發送
         if self.osc_server:
-            address = f"/encoder/{encoder_type}"
-            self.osc_server.broadcast(address, result)
+            try:
+                address = f"/encoder/{encoder_type}"
+                self.osc_server.broadcast(address, result)
+            except Exception as e:
+                logger.error(f"發送編碼器響應出錯: {e}")
 
         return result

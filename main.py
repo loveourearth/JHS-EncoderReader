@@ -18,8 +18,6 @@ import asyncio
 # 將專案根目錄添加到路徑，以便正確導入模組
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 從套件中導入需要的模組
-
 # 全局變量
 running = True
 controller = None
@@ -162,12 +160,6 @@ async def async_mode():
     global running, controller
 
     try:
-        # 不需要創建新的控制器，使用已經初始化的全局控制器
-        # controller = MainController()  # 刪除這行
-        # if not await controller.initialize_async():  # 刪除這行
-        #     logger.error("系統初始化失敗")
-        #     return 1
-
         # 創建事件循環
         loop = asyncio.get_event_loop()
 
@@ -183,26 +175,47 @@ async def async_mode():
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, handle_signal)
 
+        # 定義健康檢查協程
+        async def health_check():
+            while not stop_event.is_set():
+                try:
+                    # 檢查系統狀態
+                    status = controller.get_status()
+
+                    # 檢查編碼器連接狀態
+                    if status and "encoder" in status and not status["encoder"].get("connected", False):
+                        logger.warning("編碼器未連接，嘗試重新連接...")
+                        controller.handle_command(
+                            {"command": "connect"}, "SYSTEM")
+
+                    # 發送系統狀態到網絡
+                    if status and "info" in status:
+                        controller._send_encoder_response(
+                            status["info"], "system_status")
+
+                except Exception as e:
+                    logger.error(f"健康檢查出錯: {e}")
+
+                # 等待30秒
+                await asyncio.sleep(30)
+
+        # 啟動健康檢查任務
+        health_task = asyncio.create_task(health_check())
+
         # 等待停止事件
         try:
             logger.info("系統已啟動（非同步模式），按Ctrl+C停止...")
-
-            # # 定期執行健康檢查
-            # check_task = asyncio.create_task(periodic_health_check(controller, stop_event))
-
-            # 等待停止事件
             await stop_event.wait()
-
-            # # 取消健康檢查任務
-            # check_task.cancel()
-            # try:
-            #     await check_task
-            # except asyncio.CancelledError:
-            #     pass
-
         finally:
-            # 關閉系統通過全局控制器的關閉方法
-            controller.shutdown()  # 使用同步版本，不需要async版本
+            # 取消健康檢查任務
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
+
+            # 關閉系統
+            controller.shutdown()
             logger.info("系統已關閉（非同步模式）")
 
         return 0
@@ -218,7 +231,7 @@ async def periodic_health_check(controller, stop_event):
             # 檢查各模塊狀態
             status = controller.get_status()
 
-            # 檢查編碼器連接狀態（添加更多錯誤處理）
+            # 檢查編碼器連接狀態
             if "encoder" in status and "connected" in status["encoder"] and status["encoder"]["connected"] == False:
                 logger.warning("編碼器未連接，嘗試重新連接...")
                 # 嘗試重新連接
@@ -260,13 +273,22 @@ def handle_monitor_command(args):
 
     # 資料接收回調
     def data_callback(data):
+        if not data:
+            print("收到空資料")
+            return
+
         if format_type == "json":
             import json
             print(json.dumps(data, ensure_ascii=False))
         else:
             # 構建文本格式輸出
-            output = f"{data['address']},{data['timestamp']:.3f},{data['direction']},{data['angle']:.4f},{data['rpm'] if data['rpm'] is not None else 0:.4f},{data['laps']},{data['raw_angle']},{data['raw_rpm'] if data['raw_rpm'] is not None else 0}"
-            print(output)
+            try:
+                output = f"{data['address']},{data['timestamp']:.3f},{data['direction']},{data['angle']:.4f},{data['rpm'] if data['rpm'] is not None else 0:.4f},{data['laps']},{data['raw_angle']},{data['raw_rpm'] if data['raw_rpm'] is not None else 0}"
+                print(output)
+            except KeyError as e:
+                print(f"資料格式錯誤: 缺少欄位 {e}")
+            except Exception as e:
+                print(f"處理資料出錯: {e}")
 
     # 註冊資料更新事件監聽器
     controller.encoder_controller.register_event_listener(
@@ -289,6 +311,9 @@ def handle_monitor_command(args):
     finally:
         # 停止監測
         controller.handle_command("stop_monitor", "CLI")
+        # 取消註冊監聽器
+        controller.encoder_controller.unregister_event_listener(
+            "on_data_update", data_callback)
 
 
 def main():
@@ -388,7 +413,7 @@ def main():
             if hasattr(args, 'func'):
                 # 配置日誌
                 setup_logging(args.debug)
-                args.func(args)  # 關鍵：呼叫子命令對應的處理函數
+                args.func(args)
                 return 0
 
         # 選擇運行模式
@@ -407,14 +432,21 @@ def main():
 
             # 主循環
             while running:
-                # add system status as messages to be continuously sent via OSC, for checking is the netwrorking issue or not.
-                system_status = controller.get_status()
-                if system_status:
-                    print("System Status：", system_status)
-                    controller._send_encoder_response(
-                        system_status["info"], "system_status")  # 發送狀態
-                else:
-                    print("Could not get system status")
+                try:
+                    # 獲取系統狀態
+                    system_status = controller.get_status()
+                    if system_status and "info" in system_status:
+                        # 僅在調試模式下打印
+                        if args.debug:
+                            print("System Status：", system_status)
+                        # 發送狀態
+                        controller._send_encoder_response(
+                            system_status["info"], "system_status")
+                    else:
+                        if args.debug:
+                            print("Could not get system status")
+                except Exception as e:
+                    logger.error(f"系統狀態檢查出錯: {e}")
 
                 time.sleep(1)
 
