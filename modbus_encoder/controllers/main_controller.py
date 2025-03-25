@@ -18,156 +18,162 @@ from ..utils.config import ConfigManager
 # 配置日誌
 logger = logging.getLogger(__name__)
 
+
 class MainController:
     """主控制器類
-    
+
     協調各個子系統的運作，處理命令和事件
     """
-    
+
     def __init__(self):
         """初始化主控制器"""
         # 各子系統
         self.encoder_controller = None
         self.gpio_controller = None
         self.osc_server = None
-        
+
         # 配置管理器
         self.config_manager = ConfigManager()
-        
+
         # 狀態標誌
         self.running = False
         self.init_time = time.time()
-        
+
         # 連續監測任務
         self.continuous_tasks = {}
         self.continuous_task_lock = threading.Lock()
-        
+
         # 系統錯誤計數
         self.error_count = 0
         self.last_error = ""
-        
+
     def initialize(self) -> bool:
         """初始化系統
-        
+
         Returns:
             是否成功初始化
         """
         try:
             # 初始化編碼器控制器
             encoder_success = self.initialize_encoder()
-            
+
             # 初始化GPIO控制器
             gpio_success = self.initialize_gpio()
-            
+
             # 初始化OSC服務器
             osc_success = self.initialize_osc_server()
-            
+
             # 除非所有初始化都失敗，否則視為系統初始化成功
             # 這增加了系統的穩健性，允許部分子系統失敗
             self.running = encoder_success or gpio_success or osc_success
-            
+
             if self.running:
                 logger.info("系統初始化完成")
                 return True
             else:
                 logger.error("系統初始化完全失敗，所有子系統都未能啟動")
                 return False
-                
+
         except Exception as e:
             logger.exception(f"系統初始化失敗: {e}")
             self.last_error = str(e)
             self.error_count += 1
             self.shutdown()
             return False
-            
+
     def initialize_encoder(self) -> bool:
         """初始化編碼器控制器
-        
+
         Returns:
             是否成功初始化
         """
         try:
             # 創建編碼器控制器
             self.encoder_controller = EncoderController()
-            
+
             # 註冊事件監聽器
-            self.encoder_controller.register_event_listener("on_data_update", self._on_encoder_data_update)
-            self.encoder_controller.register_event_listener("on_zero_set", self._on_encoder_zero_set)
-            self.encoder_controller.register_event_listener("on_connection_lost", self._on_encoder_connection_lost)
-            self.encoder_controller.register_event_listener("on_connection_restored", self._on_encoder_connection_restored)
-            
+            self.encoder_controller.register_event_listener(
+                "on_data_update", self._on_encoder_data_update)
+            self.encoder_controller.register_event_listener(
+                "on_zero_set", self._on_encoder_zero_set)
+            self.encoder_controller.register_event_listener(
+                "on_connection_lost", self._on_encoder_connection_lost)
+            self.encoder_controller.register_event_listener(
+                "on_connection_restored", self._on_encoder_connection_restored)
+
             # 從配置讀取連接參數
             serial_config = self.config_manager.get_serial_config()
             modbus_config = self.config_manager.get_modbus_config()
-            
+
             # 連接設備
             success = self.encoder_controller.connect(
                 port=serial_config.get('port', '/dev/ttyUSB0'),
                 baudrate=serial_config.get('baudrate', 9600),
                 address=modbus_config.get('slave_address', 1)
             )
-            
+
             if not success:
                 logger.warning("編碼器初始化成功，但連接失敗")
-                
+
             # 即使連接失敗，初始化仍視為成功，這增加了穩健性
             # 系統可以後續重試連接
             return True
-            
+
         except Exception as e:
             logger.exception(f"初始化編碼器控制器失敗: {e}")
             self.last_error = f"編碼器控制器初始化失敗: {e}"
             self.error_count += 1
             return False
-            
+
     def initialize_gpio(self) -> bool:
         """初始化GPIO控制器
-        
+
         Returns:
             是否成功初始化
         """
         try:
             # 從配置讀取GPIO參數
             gpio_config = self.config_manager.get_gpio_config()
-            
+
             # 創建GPIO控制器
             self.gpio_controller = GPIOController()
-            
+
             # 初始化GPIO控制器
             success = self.gpio_controller.initialize(
                 output_pins=gpio_config.get('output_pins', [17, 27, 22]),
                 input_pin=gpio_config.get('input_pin', 18),
-                enable_event_detect=gpio_config.get('enable_event_detect', True)
+                enable_event_detect=gpio_config.get(
+                    'enable_event_detect', True)
             )
-            
+
             if success:
                 logger.info("GPIO控制器初始化成功")
                 return True
             else:
                 logger.warning("GPIO控制器初始化失敗")
                 return False
-                
+
         except Exception as e:
             logger.exception(f"初始化GPIO控制器失敗: {e}")
             self.last_error = f"GPIO控制器初始化失敗: {e}"
             self.error_count += 1
             return False
-            
+
     def initialize_osc_server(self) -> bool:
         """初始化OSC服務器
-        
+
         Returns:
             是否成功初始化
         """
         try:
             # 從配置讀取OSC參數
             osc_config = self.config_manager.get_osc_config()
-            
+
             # 如果OSC功能被禁用，直接返回成功
             if not osc_config.get('enabled', True):
                 logger.info("OSC服務器已在配置中禁用")
                 return True
-                
+
             # 創建OSC服務器
             self.osc_server = OSCServer(
                 host=osc_config.get('host', '0.0.0.0'),
@@ -175,26 +181,27 @@ class MainController:
                 command_handler=self.handle_command,
                 return_port=osc_config.get('return_port', 9999)  # 添加此行
             )
-            
+
             # 啟動服務器
             success = self.osc_server.start()
-            
+
             if success:
-                logger.info(f"OSC服務器啟動成功: {osc_config.get('host', '0.0.0.0')}:{osc_config.get('port', 8888)}, 返回端口: {osc_config.get('return_port', 9999)}")
+                logger.info(
+                    f"OSC服務器啟動成功: {osc_config.get('host', '0.0.0.0')}:{osc_config.get('port', 8888)}, 返回端口: {osc_config.get('return_port', 9999)}")
                 return True
             else:
                 logger.error("OSC服務器啟動失敗")
                 return False
-                
+
         except Exception as e:
             logger.exception(f"初始化OSC服務器失敗: {e}")
             self.last_error = f"OSC服務器初始化失敗: {e}"
             self.error_count += 1
             return False
-        
+
     async def initialize_async(self) -> bool:
         """非同步方式初始化系統
-        
+
         Returns:
             是否成功初始化
         """
@@ -212,12 +219,12 @@ class MainController:
         """非同步方式關閉系統"""
         # 暫時使用同步方法
         self.shutdown()
-        
+
     def shutdown(self) -> None:
         """關閉系統，確保所有資源釋放"""
         logger.info("正在關閉系統...")
         shutdown_success = True
-        
+
         # 首先停止所有監測任務
         with self.continuous_task_lock:
             task_ids = list(self.continuous_tasks.keys())
@@ -228,7 +235,7 @@ class MainController:
                 except Exception as e:
                     logger.error(f"停止任務 {task_id} 出錯: {e}")
                     shutdown_success = False
-        
+
         # 關閉OSC服務器
         if self.osc_server:
             try:
@@ -238,7 +245,7 @@ class MainController:
             except Exception as e:
                 logger.error(f"關閉OSC服務器出錯: {e}")
                 shutdown_success = False
-        
+
         # 關閉編碼器控制器
         if self.encoder_controller:
             try:
@@ -251,7 +258,7 @@ class MainController:
             except Exception as e:
                 logger.error(f"關閉編碼器控制器出錯: {e}")
                 shutdown_success = False
-        
+
         # 關閉GPIO控制器
         if self.gpio_controller:
             try:
@@ -261,21 +268,21 @@ class MainController:
             except Exception as e:
                 logger.error(f"清理GPIO資源出錯: {e}")
                 shutdown_success = False
-        
+
         self.running = False
-        
+
         if shutdown_success:
             logger.info("系統已完全關閉")
         else:
             logger.warning("系統關閉過程中發生一些錯誤，請檢查日誌")
-        
+
     def handle_command(self, command: Union[Dict[str, Any], str], source: Any) -> Dict[str, Any]:
         """處理來自不同源的命令
-        
+
         Args:
             command: 命令字典或字符串
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
@@ -289,7 +296,7 @@ class MainController:
                 parts = command.split(None, 1)  # 分割命令和參數
                 cmd_name = parts[0] if parts else ""
                 params_str = parts[1] if len(parts) > 1 else ""
-                
+
                 # 解析參數（格式如 key=value）
                 command = {"command": cmd_name}
                 if params_str:
@@ -304,16 +311,16 @@ class MainController:
                                     command[key] = int(value)
                             except ValueError:
                                 command[key] = value
-                
+
         cmd = command.get("command", "").strip().lower()
-        
+
         # 如果命令為空，返回錯誤
         if not cmd:
             return {"status": "error", "message": "缺少命令"}
-            
+
         # 記錄命令
         logger.info(f"處理命令: {cmd}, 來源: {source}")
-            
+
         # 系統命令
         if cmd == "status":
             return self.get_status()
@@ -323,12 +330,12 @@ class MainController:
             return self._handle_disconnect(command, source)
         elif cmd == "reset":
             return self._handle_reset(command, source)
-            
+
         # 編碼器命令
         if cmd.startswith("read_") or cmd == "set_zero":
             if not self.encoder_controller:
                 return {"status": "error", "message": "編碼器控制器未初始化"}
-                
+
             if cmd == "read_position":
                 return self._handle_read_position(command, source)
             elif cmd == "read_multi_position":
@@ -337,7 +344,7 @@ class MainController:
                 return self._handle_read_speed(command, source)
             elif cmd == "set_zero":
                 return self._handle_set_zero(command, source)
-                
+
         # 監測命令
         if cmd == "start_monitor":
             return self._handle_start_monitor(command, source)
@@ -345,12 +352,12 @@ class MainController:
             return self._handle_stop_monitor(command, source)
         elif cmd == "list_monitors":
             return self._handle_list_monitors(command, source)
-            
+
         # GPIO命令
         if cmd.startswith("gpio_") or cmd == "read_input":
             if not self.gpio_controller:
                 return {"status": "error", "message": "GPIO控制器未初始化"}
-                
+
             if cmd == "gpio_high":
                 return self._handle_gpio_high(command, source)
             elif cmd == "gpio_low":
@@ -361,14 +368,14 @@ class MainController:
                 return self._handle_gpio_pulse(command, source)
             elif cmd == "read_input":
                 return self._handle_read_input(command, source)
-                
+
         # 未知命令
         logger.warning(f"未知命令: {cmd}")
         return {"status": "error", "message": f"未知命令: {cmd}"}
-        
+
     def get_status(self) -> Dict[str, Any]:
         """獲取系統狀態
-        
+
         Returns:
             狀態字典
         """
@@ -378,22 +385,22 @@ class MainController:
             "uptime": int(time.time() - self.init_time),
             "error_count": self.error_count
         }
-        
+
         if self.last_error:
             status["last_error"] = self.last_error
-            
+
         # 編碼器狀態
         if self.encoder_controller:
             status["encoder"] = self.encoder_controller.get_status()
         else:
             status["encoder"] = {"initialized": False}
-            
+
         # GPIO狀態
         if self.gpio_controller:
             status["gpio"] = self.gpio_controller.get_status()
         else:
             status["gpio"] = {"initialized": False}
-            
+
         # OSC狀態
         if self.osc_server:
             osc_status = {
@@ -409,7 +416,7 @@ class MainController:
                 "running": False,
                 "enabled": osc_config.get('enabled', True)
             }
-            
+
         # 連續監測任務
         continuous_tasks = []
         with self.continuous_task_lock:
@@ -423,28 +430,28 @@ class MainController:
                     "elapsed": time.time() - task_info.get("start_time", time.time())
                 }
                 continuous_tasks.append(task_status)
-                
+
         status["continuous_tasks"] = continuous_tasks
-        
+
         return {"status": "success", "info": status}
-        
+
     def _handle_reset(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理重置系統命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             # 關閉系統
             self.shutdown()
-            
+
             # 重新初始化系統
             success = self.initialize()
-            
+
             if success:
                 return {
                     "status": "success",
@@ -463,48 +470,52 @@ class MainController:
                 "status": "error",
                 "message": f"重置系統出錯: {e}"
             }
-    
+
     # 編碼器命令處理器
-    
+
     def _handle_connect(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理連接命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         if not self.encoder_controller:
             self.encoder_controller = EncoderController()
-            
+
             # 註冊事件監聽器
-            self.encoder_controller.register_event_listener("on_data_update", self._on_encoder_data_update)
-            self.encoder_controller.register_event_listener("on_zero_set", self._on_encoder_zero_set)
-            self.encoder_controller.register_event_listener("on_connection_lost", self._on_encoder_connection_lost)
-            self.encoder_controller.register_event_listener("on_connection_restored", self._on_encoder_connection_restored)
-            
+            self.encoder_controller.register_event_listener(
+                "on_data_update", self._on_encoder_data_update)
+            self.encoder_controller.register_event_listener(
+                "on_zero_set", self._on_encoder_zero_set)
+            self.encoder_controller.register_event_listener(
+                "on_connection_lost", self._on_encoder_connection_lost)
+            self.encoder_controller.register_event_listener(
+                "on_connection_restored", self._on_encoder_connection_restored)
+
         port = params.get("port", "/dev/ttyUSB0")
         baudrate = params.get("baudrate", 9600)
         address = params.get("address", 1)
-        
+
         success = self.encoder_controller.connect(port, baudrate, address)
-        
+
         if success:
             # 更新配置
             serial_config = self.config_manager.get_serial_config()
             serial_config['port'] = port
             serial_config['baudrate'] = baudrate
             self.config_manager.set_serial_config(serial_config)
-            
+
             modbus_config = self.config_manager.get_modbus_config()
             modbus_config['slave_address'] = address
             self.config_manager.set_modbus_config(modbus_config)
-            
+
             # 保存配置
             self.config_manager.save()
-            
+
             return {
                 "status": "success",
                 "message": f"成功連接到編碼器: 端口={port}, 波特率={baudrate}, 地址={address}"
@@ -514,20 +525,20 @@ class MainController:
                 "status": "error",
                 "message": "連接編碼器失敗，請確認設備已正確連接並已開啟電源"
             }
-            
+
     def _handle_disconnect(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理斷開連接命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         if not self.encoder_controller:
             return {"status": "error", "message": "編碼器控制器未初始化"}
-            
+
         # 停止所有與編碼器相關的連續監測任務
         with self.continuous_task_lock:
             for task_id in list(self.continuous_tasks.keys()):
@@ -536,32 +547,31 @@ class MainController:
                         self._stop_continuous_task(task_id)
                 except Exception as e:
                     logger.error(f"停止任務 {task_id} 出錯: {e}")
-                    
+
         # 斷開連接
         self.encoder_controller.disconnect()
-        
+
         return {
             "status": "success",
             "message": "已斷開與編碼器的連接"
         }
-            
-            
+
     def _handle_read_position(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理讀取位置命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         success, result = self.encoder_controller.read_position()
-        
+
         if success:
             lap_count = self.encoder_controller.get_lap_count()
             direction = self.encoder_controller.get_direction()
-            
+
             response = {
                 "status": "success",
                 "position": result,
@@ -574,22 +584,22 @@ class MainController:
                 "status": "error",
                 "message": result
             }
-        
+
         # 使用統一回應處理函數
         return self._send_encoder_response(response, "position")
-            
+
     def _handle_read_multi_position(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理讀取多圈位置命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         success, result = self.encoder_controller.read_multi_position()
-        
+
         if success:
             response = {
                 "status": "success",
@@ -601,26 +611,26 @@ class MainController:
                 "status": "error",
                 "message": result
             }
-        
+
         # 使用統一回應處理函數
         return self._send_encoder_response(response, "multi_position")
-            
+
     def _handle_read_speed(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理讀取速度命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         success, result = self.encoder_controller.read_speed()
-        
+
         if success:
             direction = self.encoder_controller.get_direction()
             direction_str = "逆時針" if direction == 1 else "順時針"
-            
+
             response = {
                 "status": "success",
                 "speed": result,
@@ -634,16 +644,15 @@ class MainController:
                 "status": "error",
                 "message": result
             }
-        
+
         # 使用統一回應處理函數
         return self._send_encoder_response(response, "speed")
-            
-            
+
     def _handle_set_zero(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理設置零點命令"""
         try:
             success, error = self.encoder_controller.set_zero()
-            
+
             if success:
                 # 成功情況下返回特殊標記，不發送回應（由事件系統處理）
                 return {"status": "success", "handled_by_event": True}
@@ -663,27 +672,26 @@ class MainController:
                 "type": "zero_set"
             }
             return self._send_encoder_response(response, "zero_set")
-            
-    
+
     def _handle_gpio_high(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理GPIO輸出高電位命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             pin = params.get("pin")
             gpio = params.get("gpio")
-            
+
             if pin is not None:
                 # 使用索引控制
                 pin_index = int(pin)
                 success = self.gpio_controller.set_output(pin_index, True)
-                
+
                 if success:
                     pin_mapping = self.gpio_controller.get_pin_mapping()
                     gpio_pin = pin_mapping.get(pin_index)
@@ -700,15 +708,16 @@ class MainController:
                         "message": f"設置GPIO索引 {pin_index} 失敗",
                         "pin": pin_index
                     }
-                
+
                 # 使用統一回應處理函數
                 return self._send_gpio_response(result, "gpio_high")
-                
+
             elif gpio is not None:
                 # 使用GPIO號碼
                 gpio_pin = int(gpio)
-                success = self.gpio_controller.set_output_by_gpio(gpio_pin, True)
-                
+                success = self.gpio_controller.set_output_by_gpio(
+                    gpio_pin, True)
+
                 if success:
                     result = {
                         "status": "success",
@@ -722,17 +731,17 @@ class MainController:
                         "message": f"設置GPIO {gpio_pin} 失敗",
                         "gpio": gpio_pin
                     }
-                
+
                 # 使用統一回應處理函數
                 return self._send_gpio_response(result, "gpio_high")
-                
+
             else:
                 result = {
                     "status": "error",
                     "message": "缺少參數: pin或gpio"
                 }
                 return self._send_gpio_response(result, "gpio_high")
-                
+
         except Exception as e:
             logger.exception(f"設置GPIO出錯: {e}")
             self.last_error = f"設置GPIO出錯: {e}"
@@ -742,27 +751,26 @@ class MainController:
                 "message": f"設置GPIO出錯: {str(e)}"
             }
             return self._send_gpio_response(result, "gpio_high")
-            
-            
+
     def _handle_gpio_low(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理GPIO輸出低電位命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             pin = params.get("pin")
             gpio = params.get("gpio")
-            
+
             if pin is not None:
                 # 使用索引控制
                 pin_index = int(pin)
                 success = self.gpio_controller.set_output(pin_index, False)
-                
+
                 if success:
                     pin_mapping = self.gpio_controller.get_pin_mapping()
                     gpio_pin = pin_mapping.get(pin_index)
@@ -779,15 +787,16 @@ class MainController:
                         "message": f"設置GPIO索引 {pin_index} 失敗",
                         "pin": pin_index
                     }
-                
+
                 # 使用統一回應處理函數
                 return self._send_gpio_response(result, "gpio_low")
-                
+
             elif gpio is not None:
                 # 使用GPIO號碼
                 gpio_pin = int(gpio)
-                success = self.gpio_controller.set_output_by_gpio(gpio_pin, False)
-                
+                success = self.gpio_controller.set_output_by_gpio(
+                    gpio_pin, False)
+
                 if success:
                     result = {
                         "status": "success",
@@ -801,17 +810,17 @@ class MainController:
                         "message": f"設置GPIO {gpio_pin} 失敗",
                         "gpio": gpio_pin
                     }
-                
+
                 # 使用統一回應處理函數
                 return self._send_gpio_response(result, "gpio_low")
-                
+
             else:
                 result = {
                     "status": "error",
                     "message": "缺少參數: pin或gpio"
                 }
                 return self._send_gpio_response(result, "gpio_low")
-                
+
         except Exception as e:
             logger.exception(f"設置GPIO出錯: {e}")
             self.last_error = f"設置GPIO出錯: {e}"
@@ -821,21 +830,21 @@ class MainController:
                 "message": f"設置GPIO出錯: {str(e)}"
             }
             return self._send_gpio_response(result, "gpio_low")
-            
+
     def _handle_gpio_toggle(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理GPIO切換命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             pin_index = int(params.get("pin", 0))
             new_state = self.gpio_controller.toggle_output(pin_index)
-            
+
             if new_state is not None:
                 gpio_pin = self.gpio_controller.get_pin_mapping().get(pin_index)
                 result = {
@@ -851,10 +860,10 @@ class MainController:
                     "message": f"切換GPIO索引 {pin_index} 失敗",
                     "pin": pin_index
                 }
-            
+
             # 使用統一回應處理函數
             return self._send_gpio_response(result, "gpio_toggle")
-            
+
         except Exception as e:
             logger.exception(f"切換GPIO出錯: {e}")
             self.last_error = f"切換GPIO出錯: {e}"
@@ -864,24 +873,23 @@ class MainController:
                 "message": f"切換GPIO出錯: {str(e)}"
             }
             return self._send_gpio_response(result, "gpio_toggle")
-        
-            
+
     def _handle_gpio_pulse(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理GPIO脈衝命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             pin_index = int(params.get("pin", 0))
             duration = float(params.get("duration", 0.5))
-            
+
             success = self.gpio_controller.pulse_output(pin_index, duration)
-            
+
             if success:
                 gpio_pin = self.gpio_controller.get_pin_mapping().get(pin_index)
                 result = {
@@ -897,10 +905,10 @@ class MainController:
                     "message": f"產生GPIO脈衝失敗",
                     "pin": pin_index
                 }
-            
+
             # 使用統一回應處理函數
             return self._send_gpio_response(result, "gpio_pulse")
-            
+
         except Exception as e:
             logger.exception(f"產生GPIO脈衝出錯: {e}")
             self.last_error = f"產生GPIO脈衝出錯: {e}"
@@ -910,20 +918,20 @@ class MainController:
                 "message": f"產生GPIO脈衝出錯: {str(e)}"
             }
             return self._send_gpio_response(result, "gpio_pulse")
-            
+
     def _handle_read_input(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理讀取GPIO輸入命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         try:
             state = self.gpio_controller.get_input()
-            
+
             if state is not None:
                 result = {
                     "status": "success",
@@ -937,10 +945,10 @@ class MainController:
                     "status": "error",
                     "message": "讀取GPIO輸入失敗"
                 }
-            
+
             # 使用統一回應處理函數
             return self._send_gpio_response(result, "input")
-            
+
         except Exception as e:
             logger.exception(f"讀取GPIO輸入出錯: {e}")
             self.last_error = f"讀取GPIO輸入出錯: {e}"
@@ -951,43 +959,43 @@ class MainController:
             }
             return self._send_gpio_response(result, "input")
 
-
     def _handle_start_monitor(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理開始監測命令"""
         if not self.encoder_controller:
             return {
-                "status": "error", 
-                "message": "編碼器控制器未初始化", 
+                "status": "error",
+                "message": "編碼器控制器未初始化",
                 "type": "start_monitor"
             }
-            
+
         # 獲取監測參數
         interval = float(params.get("interval", 0.5))
         format_type = params.get("format", "text")
-        
+
         # 驗證參數
         if interval < 0.1:
             return {
-                "status": "error", 
-                "message": "間隔時間必須大於等於0.1秒", 
+                "status": "error",
+                "message": "間隔時間必須大於等於0.1秒",
                 "type": "start_monitor"
             }
-        
+
         # 生成任務ID
         import uuid
         task_id = str(uuid.uuid4())
-        
+
         try:
             # 使用編碼器控制器的監測功能
-            success, result = self.encoder_controller.start_monitoring(interval)
-            
+            success, result = self.encoder_controller.start_monitoring(
+                interval)
+
             if not success:
                 return {
-                    "status": "error", 
-                    "message": result, 
+                    "status": "error",
+                    "message": result,
                     "type": "start_monitor"
                 }
-                
+
             # 記錄任務信息
             with self.continuous_task_lock:
                 self.continuous_tasks[task_id] = {
@@ -998,24 +1006,24 @@ class MainController:
                     "start_time": time.time(),
                     "source": source
                 }
-            
+
             # 手動觸發監測啟動事件
             self._trigger_monitor_event(task_id, interval, format_type)
-            
+
             # 返回特殊標記，表示已由事件系統處理
             return {"status": "success", "handled_by_event": True}
         except Exception as e:
             logger.exception(f"開始監測出錯: {e}")
             return {
-                "status": "error", 
-                "message": f"開始監測出錯: {e}", 
+                "status": "error",
+                "message": f"開始監測出錯: {e}",
                 "type": "start_monitor"
             }
 
     def _handle_stop_monitor(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理停止監測命令"""
         task_id = params.get("task_id")
-        
+
         try:
             if not task_id:
                 # 如果未指定任務ID，停止所有任務
@@ -1023,25 +1031,25 @@ class MainController:
                     task_count = len(self.continuous_tasks)
                     for tid in list(self.continuous_tasks.keys()):
                         self._stop_continuous_task(tid)
-                        
+
                     # 通知編碼器控制器停止監測
                     if self.encoder_controller:
                         self.encoder_controller.stop_monitoring()
-                        
+
                     # 手動觸發監測停止事件
                     self._trigger_monitor_stop_event(None, task_count)
-                    
+
                     # 返回特殊標記，表示已由事件系統處理
                     return {"status": "success", "handled_by_event": True}
-                    
+
             # 停止指定任務
             with self.continuous_task_lock:
                 if task_id in self.continuous_tasks:
                     self._stop_continuous_task(task_id)
-                    
+
                     # 手動觸發監測停止事件
                     self._trigger_monitor_stop_event(task_id, 1)
-                    
+
                     # 返回特殊標記，表示已由事件系統處理
                     return {"status": "success", "handled_by_event": True}
                 else:
@@ -1058,19 +1066,19 @@ class MainController:
                 "message": f"停止監測出錯: {e}",
                 "type": "stop_monitor"
             }
-            
+
     def _handle_list_monitors(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理列出監測任務命令
-        
+
         Args:
             params: 命令參數
             source: 命令來源
-            
+
         Returns:
             處理結果
         """
         tasks = []
-        
+
         with self.continuous_task_lock:
             for task_id, task_info in self.continuous_tasks.items():
                 task_data = {
@@ -1083,7 +1091,7 @@ class MainController:
                     "elapsed": time.time() - task_info.get("start_time", time.time())
                 }
                 tasks.append(task_data)
-                
+
         return {
             "status": "success",
             "task_count": len(tasks),
@@ -1094,7 +1102,7 @@ class MainController:
         """觸發監測啟動事件"""
         if not self.osc_server:
             return
-            
+
         event_data = {
             "status": "success",
             "type": "start_monitor",
@@ -1104,71 +1112,70 @@ class MainController:
             "format": format_type,
             "timestamp": time.time()
         }
-        
+
         # 廣播到所有客戶端
         self.osc_server.broadcast("/encoder/start_monitor", event_data)
-        
+
     def _trigger_monitor_stop_event(self, task_id: Optional[str], task_count: int) -> None:
         """觸發監測停止事件"""
         if not self.osc_server:
             return
-            
+
         event_data = {
             "status": "success",
             "type": "stop_monitor",
             "timestamp": time.time()
         }
-        
+
         if task_id:
             event_data["message"] = f"已停止監測任務 {task_id}"
             event_data["task_id"] = task_id
         else:
             event_data["message"] = f"已停止所有監測任務 ({task_count}個)"
-        
+
         # 廣播到所有客戶端
         self.osc_server.broadcast("/encoder/stop_monitor", event_data)
-        
+
     def _stop_continuous_task(self, task_id: str) -> None:
         """停止連續任務
-        
+
         Args:
             task_id: 任務ID
         """
         if task_id not in self.continuous_tasks:
             return
-            
+
         # 標記為不運行
         self.continuous_tasks[task_id]["running"] = False
-        
+
         # 從任務字典中移除
         self.continuous_tasks.pop(task_id, None)
-        
+
         # 如果沒有與編碼器相關的任務，停止編碼器監測
-        encoder_tasks = [t for t in self.continuous_tasks.values() 
-                          if t.get("type", "").startswith("encoder_") and t.get("running", False)]
-        
+        encoder_tasks = [t for t in self.continuous_tasks.values()
+                         if t.get("type", "").startswith("encoder_") and t.get("running", False)]
+
         if not encoder_tasks and self.encoder_controller:
             self.encoder_controller.stop_monitoring()
-            
-    
+
     def _on_encoder_data_update(self, data: Dict[str, Any]) -> None:
         """編碼器資料更新事件處理器
-        
+
         Args:
             data: 事件資料
         """
         if not self.osc_server:
             return
-                
+
         # 發送到所有任務目標
         with self.continuous_task_lock:
             for task_id, task_info in self.continuous_tasks.items():
                 if not task_info.get("running", False):
                     continue
-                    
+
                 source = task_info.get("source")
                 format_type = task_info.get("format", "text")
-                
+
                 # 根據格式類型發送資料
                 if format_type.lower() == "json":
                     # JSON 格式 - 添加类型标识
@@ -1199,23 +1206,23 @@ class MainController:
                     # Check if rpm or raw_rpm is None and provide default values
                     rpm_value = data['rpm'] if data['rpm'] is not None else 0
                     raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
-                    
+
                     result = f"{data['address']},{data['timestamp']:.3f},{data['direction']},{data['angle']:.4f},{rpm_value:.4f},{data['laps']},{data['raw_angle']},{raw_rpm_value}\n"
-                        
+
                 # 發送資料
                 if source:
                     # 廣播到所有客户端
                     self.osc_server.broadcast("/encoder/monitor_data", result)
-                    
+
     def _on_encoder_zero_set(self, data: Dict[str, Any]) -> None:
         """編碼器零點設置事件處理器
-        
+
         Args:
             data: 事件數據
         """
         if not self.osc_server:
             return
-            
+
         # 發送零點重置事件
         event_data = {
             "status": "success",
@@ -1224,23 +1231,23 @@ class MainController:
             "position": data["position"],
             "laps": data["laps"]
         }
-        
+
         # 廣播到所有客戶端
         self.osc_server.broadcast("/encoder/zero_set", event_data)
-        
+
     def _on_encoder_connection_lost(self, error: str) -> None:
         """編碼器連接丟失事件處理器
-        
+
         Args:
             error: 錯誤信息
         """
         if not self.osc_server:
             return
-            
+
         # 更新系統錯誤計數和最後錯誤
         self.last_error = f"編碼器連接丟失: {error}"
         self.error_count += 1
-        
+
         # 發送連接丟失事件
         event_data = {
             "status": "error",
@@ -1248,53 +1255,52 @@ class MainController:
             "timestamp": time.time(),
             "message": error
         }
-        
+
         # 廣播到所有客戶端
         self.osc_server.broadcast("/encoder/connection", event_data)
-        
+
     def _on_encoder_connection_restored(self, data: None) -> None:
         """編碼器連接恢復事件處理器
-        
+
         Args:
             data: 事件數據
         """
         if not self.osc_server:
             return
-            
+
         # 發送連接恢復事件
         event_data = {
             "status": "success",
             "type": "connection_restored",
             "timestamp": time.time()
         }
-        
+
         # 廣播到所有客戶端
         self.osc_server.broadcast("/encoder/connection", event_data)
-        
 
     def execute_with_retry(self, func: Callable, *args, max_retries: int = 3, retry_delay: float = 0.5, **kwargs) -> Any:
         """執行函數並在失敗時自動重試
-        
+
         Args:
             func: 要執行的函數
             *args: 函數參數
             max_retries: 最大重試次數
             retry_delay: 初始重試延遲（秒，每次重試會增加）
             **kwargs: 函數關鍵字參數
-            
+
         Returns:
             函數執行結果
-            
+
         Raises:
             Exception: 重試失敗時拋出的異常
         """
         retries = 0
         last_error = None
-        
+
         while retries <= max_retries:
             try:
                 result = func(*args, **kwargs)
-                
+
                 # 對於返回元組 (success, data) 格式的函數
                 if isinstance(result, tuple) and len(result) >= 1 and isinstance(result[0], bool):
                     if result[0]:  # 如果成功
@@ -1306,67 +1312,70 @@ class MainController:
                 # 對於返回其他類型的函數，非None值視為成功
                 elif result is not None:
                     return result
-                
+
                 # 執行到這裡表示需要重試
                 retries += 1
                 if retries <= max_retries:
                     delay = retry_delay * retries
-                    logger.warning(f"操作失敗，將在 {delay:.1f} 秒後重試 ({retries}/{max_retries})")
+                    logger.warning(
+                        f"操作失敗，將在 {delay:.1f} 秒後重試 ({retries}/{max_retries})")
                     time.sleep(delay)
             except Exception as e:
                 last_error = e
                 retries += 1
                 if retries <= max_retries:
                     delay = retry_delay * retries
-                    logger.warning(f"操作出錯，將在 {delay:.1f} 秒後重試 ({retries}/{max_retries}): {e}")
+                    logger.warning(
+                        f"操作出錯，將在 {delay:.1f} 秒後重試 ({retries}/{max_retries}): {e}")
                     time.sleep(delay)
-        
+
         # 所有重試都失敗
         if isinstance(last_error, Exception):
             self.last_error = str(last_error)
             self.error_count += 1
             raise last_error
-        
+
         return {"status": "error", "message": "操作多次重試後仍然失敗"}
-    
+
     def _send_gpio_response(self, result: Dict[str, Any], gpio_type: str) -> Dict[str, Any]:
         """統一處理 GPIO 回應並廣播
-        
+
         Args:
             result: 回應結果字典
             gpio_type: GPIO 操作類型
-            
+
         Returns:
             處理結果
         """
         # 添加類型標識
         if "type" not in result:
             result["type"] = gpio_type
-            
+
         # 使用 broadcast 發送
         if self.osc_server:
-            address = "/gpio/response" if result.get("status") == "success" else "/gpio/error"
+            address = "/gpio/response" if result.get(
+                "status") == "success" else "/gpio/error"
             self.osc_server.broadcast(address, result)
-            
+
         return result
 
     def _send_encoder_response(self, result: Dict[str, Any], encoder_type: str) -> Dict[str, Any]:
         """統一處理編碼器回應並廣播
-        
+
         Args:
             result: 回應結果字典
             encoder_type: 編碼器操作類型
-            
+
         Returns:
             處理結果
         """
         # 添加類型標識
         if "type" not in result:
             result["type"] = encoder_type
-            
+
         # 使用 broadcast 發送
         if self.osc_server:
             address = f"/encoder/{encoder_type}"
             self.osc_server.broadcast(address, result)
-            
+
         return result
