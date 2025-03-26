@@ -39,7 +39,9 @@ DEFAULT_CONFIG = {
         "host": "0.0.0.0",
         "port": 8888,
         "enabled": True,
-        "default_format": "text"
+        "default_format": "text",
+        "heartbeat_interval": 120,  # 新增：心跳間隔（秒）
+        "heartbeat_enabled": True   # 新增：是否啟用心跳
     },
     "logging": {
         "level": "INFO",
@@ -51,8 +53,11 @@ DEFAULT_CONFIG = {
     "system": {
         "max_retries": 3,
         "retry_interval": 5,
-        "auto_reconnect": True,
-        "health_check_interval": 30
+        "auto_reconnect": True
+    },
+    "device": {
+        "name": "encoder-pi",  # 預設設備名稱
+        "id": "001"            # 預設設備ID
     }
 }
 
@@ -326,134 +331,10 @@ class ConfigManager:
         
         return (not has_errors, errors)
 
-    def load_with_validation(self) -> Tuple[bool, Optional[Dict[str, List[str]]]]:
-        """載入並驗證配置
-        
-        Returns:
-            (配置是否有效, 錯誤信息)
-        """
-        self.config = self._load_config()
-        valid, errors = self.validate_config()
-        
-        if not valid:
-            logger.warning("配置驗證失敗，有以下問題：")
-            for section, section_errors in errors.items():
-                if section_errors:
-                    for error in section_errors:
-                        logger.warning(f"[{section}] {error}")
-            
-            # 修復可修復的問題
-            fixed_config = self._auto_fix_config()
-            if fixed_config:
-                logger.info("已自動修復配置問題，將使用修復後的配置")
-                self.config = fixed_config
-                # 保存修復後的配置
-                self._save_config(fixed_config)
-                return True, None
-            else:
-                # 重置為安全的預設配置
-                logger.warning("無法修復所有配置問題，將使用預設配置")
-                self.config = DEFAULT_CONFIG.copy()
-                return False, errors
-        
-        return True, None
-
-    def _auto_fix_config(self) -> Optional[Dict[str, Any]]:
-        """嘗試自動修復配置問題
-        
-        Returns:
-            修復後的配置字典，若無法修復則為None
-        """
-        fixed_config = self.config.copy()
-        valid, errors = self.validate_config()
-        
-        if not valid:
-            # 修復串口配置
-            if 'serial' in fixed_config and errors['serial']:
-                serial_config = fixed_config['serial']
-                
-                # 修復波特率
-                if "波特率" in str(errors['serial']):
-                    baudrate = serial_config.get('baudrate', 9600)
-                    if not isinstance(baudrate, int) or baudrate not in [9600, 19200, 38400, 57600, 115200]:
-                        serial_config['baudrate'] = 9600
-                        logger.info(f"已修復波特率為預設值: 9600")
-                
-                # 修復端口
-                if "缺少串口端口配置" in str(errors['serial']):
-                    serial_config['port'] = '/dev/ttyUSB0'
-                    logger.info(f"已修復串口端口為預設值: /dev/ttyUSB0")
-            
-            # 修復Modbus配置
-            if 'modbus' in fixed_config and errors['modbus']:
-                modbus_config = fixed_config['modbus']
-                
-                # 修復從站地址
-                if "從站地址" in str(errors['modbus']):
-                    slave_address = modbus_config.get('slave_address', 0)
-                    if not isinstance(slave_address, int) or not (1 <= slave_address <= 255):
-                        modbus_config['slave_address'] = 1
-                        logger.info(f"已修復從站地址為預設值: 1")
-            
-            # 修復編碼器配置
-            if 'encoder' in fixed_config and errors['encoder']:
-                encoder_config = fixed_config['encoder']
-                
-                # 修復分辨率
-                if "編碼器分辨率" in str(errors['encoder']):
-                    resolution = encoder_config.get('resolution', 0)
-                    if not isinstance(resolution, int) or resolution <= 0:
-                        encoder_config['resolution'] = 4096
-                        logger.info(f"已修復編碼器分辨率為預設值: 4096")
-            
-            # 修復GPIO配置
-            if 'gpio' in fixed_config and errors['gpio']:
-                gpio_config = fixed_config['gpio']
-                
-                # 修復輸出引腳
-                if "輸出引腳" in str(errors['gpio']):
-                    output_pins = gpio_config.get('output_pins', [])
-                    if not isinstance(output_pins, list) or len(output_pins) == 0:
-                        gpio_config['output_pins'] = [17, 27, 22]
-                        logger.info(f"已修復GPIO輸出引腳為預設值: [17, 27, 22]")
-            
-            # 修復OSC配置
-            if 'osc' in fixed_config and errors['osc']:
-                osc_config = fixed_config['osc']
-                
-                # 修復端口
-                if "OSC端口" in str(errors['osc']):
-                    port = osc_config.get('port', 0)
-                    if not isinstance(port, int) or not (1024 <= port <= 65535):
-                        osc_config['port'] = 8888
-                        logger.info(f"已修復OSC端口為預設值: 8888")
-        
-        # 再次驗證修復後的配置
-        fixed_valid, fixed_errors = self.validate_config_with_dict(fixed_config)
-        if fixed_valid:
-            return fixed_config
-        else:
-            return None  # 無法完全修復
-
-    def validate_config_with_dict(self, config: Dict[str, Any]) -> Tuple[bool, Dict[str, List[str]]]:
-        """驗證指定的配置字典
-        
-        Args:
-            config: 要驗證的配置字典
-            
-        Returns:
-            (是否有效, 錯誤信息)
-        """
-        # 保存原始配置
-        original_config = self.config
-        
-        # 臨時設置配置為要驗證的配置
-        self.config = config
-        
-        # 驗證
-        valid, errors = self.validate_config()
-        
-        # 恢復原始配置
-        self.config = original_config
-        
-        return valid, errors
+    
+    def get_device_name(self) -> str:
+        """獲取設備名稱"""
+        device_config = self.config.get('device', {})
+        name = device_config.get('name', 'encoder-pi')
+        device_id = device_config.get('id', '000')
+        return f"{name}-{device_id}"  # 例如 "encoder-pi-001"

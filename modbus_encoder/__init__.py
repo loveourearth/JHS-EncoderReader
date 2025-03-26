@@ -13,12 +13,16 @@ __description__ = 'Modbus編碼器控制系統'
 # 從子模組導入關鍵功能以便於使用
 from .controllers import EncoderController, GPIOController, MainController
 from .utils.config import ConfigManager
+from .utils.resource_manager import ResourceManager
+from .utils.resource_manager import EncoderResourceMonitor
 
 __all__ = [
     'EncoderController',
     'GPIOController',
     'MainController',
     'ConfigManager',
+    'ResourceManager',
+    'EncoderResourceMonitor',
     '__version__',
     '__author__',
     '__license__',

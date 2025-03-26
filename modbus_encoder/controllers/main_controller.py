@@ -4,6 +4,7 @@
 協調各個子系統的運作，處理命令分發和結果整合
 確保系統穩健運行，提供全面的錯誤處理
 """
+import asyncio
 import json
 import time
 import logging
@@ -209,9 +210,76 @@ class MainController:
             return False
 
     async def shutdown_async(self) -> None:
-        """非同步方式關閉系統"""
-        # 暫時使用同步方法
-        self.shutdown()
+        """非同步方式關閉系統，確保所有異步資源都正確釋放"""
+        logger.info("正在以異步方式關閉系統...")
+        shutdown_success = True
+        
+        # 首先停止所有監測任務
+        with self.continuous_task_lock:
+            task_ids = list(self.continuous_tasks.keys())
+            for task_id in task_ids:
+                try:
+                    logger.info(f"停止任務 {task_id}")
+                    self._stop_continuous_task(task_id)
+                except Exception as e:
+                    logger.error(f"停止任務 {task_id} 出錯: {e}")
+                    shutdown_success = False
+        
+        # 關閉OSC服務器        
+        if self.osc_server:
+            try:
+                logger.info("正在關閉OSC服務器...")
+                # 使用協程事件確保服務器正確關閉
+                stop_future = asyncio.get_event_loop().create_future()
+                
+                def on_server_closed():
+                    if not stop_future.done():
+                        stop_future.set_result(True)
+                
+                threading.Thread(
+                    target=lambda: (self.osc_server.stop(), on_server_closed())
+                ).start()
+                
+                # 設置超時
+                try:
+                    await asyncio.wait_for(stop_future, timeout=3.0)
+                    logger.info("OSC服務器已關閉")
+                except asyncio.TimeoutError:
+                    logger.warning("關閉OSC服務器超時，強制繼續")
+                    shutdown_success = False
+            except Exception as e:
+                logger.error(f"關閉OSC服務器出錯: {e}")
+                shutdown_success = False
+        
+        # 關閉編碼器控制器
+        if self.encoder_controller:
+            try:
+                logger.info("正在關閉編碼器控制器...")
+                # 先確保停止監測
+                self.encoder_controller.stop_monitoring()
+                # 然後斷開連接
+                self.encoder_controller.disconnect()
+                logger.info("編碼器控制器已關閉")
+            except Exception as e:
+                logger.error(f"關閉編碼器控制器出錯: {e}")
+                shutdown_success = False
+        
+        # 關閉GPIO控制器
+        if self.gpio_controller:
+            try:
+                logger.info("正在清理GPIO資源...")
+                self.gpio_controller.cleanup()
+                logger.info("GPIO資源已清理")
+            except Exception as e:
+                logger.error(f"清理GPIO資源出錯: {e}")
+                shutdown_success = False
+        
+        self.running = False
+        
+        if shutdown_success:
+            logger.info("系統已完全關閉 (異步方式)")
+        else:
+            logger.warning("系統關閉過程中發生一些錯誤，請檢查日誌")
         
     def shutdown(self) -> None:
         """關閉系統，確保所有資源釋放"""
@@ -268,6 +336,7 @@ class MainController:
             logger.info("系統已完全關閉")
         else:
             logger.warning("系統關閉過程中發生一些錯誤，請檢查日誌")
+
         
     def handle_command(self, command: Union[Dict[str, Any], str], source: Any) -> Dict[str, Any]:
         """處理來自不同源的命令
@@ -323,6 +392,8 @@ class MainController:
             return self._handle_disconnect(command, source)
         elif cmd == "reset":
             return self._handle_reset(command, source)
+        elif cmd == "get_device_info":
+            return self._handle_get_device_info(command, source)
             
         # 編碼器命令
         if cmd.startswith("read_") or cmd == "set_zero":
@@ -953,17 +1024,17 @@ class MainController:
 
 
     def _handle_start_monitor(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
-        """處理開始監測命令"""
+        """處理開始監測命令，使用 Singleton 模式，嚴格保證每個客戶端只有一個監測任務"""
         if not self.encoder_controller:
             return {
                 "status": "error", 
                 "message": "編碼器控制器未初始化", 
                 "type": "start_monitor"
             }
-            
+                
         # 獲取監測參數
         interval = float(params.get("interval", 0.5))
-        format_type = params.get("format", "text")
+        format_type = params.get("format", "osc")
         
         # 驗證參數
         if interval < 0.1:
@@ -973,54 +1044,112 @@ class MainController:
                 "type": "start_monitor"
             }
         
-        # 生成任務ID
-        import uuid
-        task_id = str(uuid.uuid4())
-        
-        try:
-            # 使用編碼器控制器的監測功能
-            success, result = self.encoder_controller.start_monitoring(interval)
+        # 使用任務鎖確保整個檢查和停止/啟動過程的原子性
+        with self.continuous_task_lock:
+            # 檢查該來源是否已有監測任務
+            existing_task_id = None
+            for task_id, task_info in self.continuous_tasks.items():
+                if task_info.get("source") == source and task_info.get("type") == "encoder_monitor" and task_info.get("running", False):
+                    existing_task_id = task_id
+                    break
             
-            if not success:
-                return {
-                    "status": "error", 
-                    "message": result, 
-                    "type": "start_monitor"
-                }
+            # 如果該客戶端已有監測任務，則先確保它完全停止
+            if existing_task_id:
+                logger.info(f"來源 {source} 已有監測任務 {existing_task_id}，將先停止該任務")
+                # 使用任務停止方法徹底停止舊任務
+                self._stop_continuous_task(existing_task_id)
                 
-            # 記錄任務信息
-            with self.continuous_task_lock:
+                # 等待確認任務確實停止
+                timeout = time.time() + 1.0  # 1秒超時
+                while existing_task_id in self.continuous_tasks and time.time() < timeout:
+                    time.sleep(0.05)
+                    
+                # 再次確認舊任務已經不存在
+                if existing_task_id in self.continuous_tasks:
+                    logger.warning(f"無法確認舊任務 {existing_task_id} 已停止，強制移除")
+                    self.continuous_tasks.pop(existing_task_id, None)
+            
+            # 生成任務ID
+            import uuid
+            task_id = str(uuid.uuid4())
+            
+            # 確保編碼器監測器沒有運行
+            if self.encoder_controller.monitoring_thread and self.encoder_controller.monitoring_thread.is_alive():
+                self.encoder_controller.stop_monitoring()
+                # 給一些時間讓監測線程真正停止
+                time.sleep(0.2)
+            
+            # 現在啟動一個全新的監測任務
+            try:
+                # 使用編碼器控制器的監測功能
+                success, result = self.encoder_controller.start_monitoring(interval)
+                
+                if not success:
+                    return {
+                        "status": "error", 
+                        "message": result, 
+                        "type": "start_monitor"
+                    }
+                        
+                # 記錄任務信息
                 self.continuous_tasks[task_id] = {
                     "type": "encoder_monitor",
                     "interval": interval,
                     "format": format_type,
                     "running": True,
                     "start_time": time.time(),
-                    "source": source
+                    "source": source,
+                    "last_data": None,
+                    "last_sent_time": 0
                 }
-            
-            # 手動觸發監測啟動事件
-            self._trigger_monitor_event(task_id, interval, format_type)
-            
-            # 返回特殊標記，表示已由事件系統處理
-            return {"status": "success", "handled_by_event": True}
-        except Exception as e:
-            logger.exception(f"開始監測出錯: {e}")
-            return {
-                "status": "error", 
-                "message": f"開始監測出錯: {e}", 
-                "type": "start_monitor"
-            }
+                
+                # 手動觸發監測啟動事件
+                self._trigger_monitor_event(task_id, interval, format_type)
+                
+                # 返回成功結果
+                return {
+                    "status": "success", 
+                    "message": f"成功啟動監測 (間隔: {interval}秒)",
+                    "task_id": task_id,
+                    "handled_by_event": True
+                }
+            except Exception as e:
+                logger.exception(f"開始監測出錯: {e}")
+                return {
+                    "status": "error", 
+                    "message": f"開始監測出錯: {e}", 
+                    "type": "start_monitor"
+                }
 
     def _handle_stop_monitor(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
-        """處理停止監測命令"""
+        """處理停止監測命令，增強錯誤提示和無效任務ID處理
+        
+        Args:
+            params: 命令參數
+            source: 命令來源
+                
+        Returns:
+            處理結果
+        """
         task_id = params.get("task_id")
         
         try:
+            # 獲取當前所有監測任務
+            active_tasks = []
+            with self.continuous_task_lock:
+                active_tasks = list(self.continuous_tasks.keys())
+                
             if not task_id:
                 # 如果未指定任務ID，停止所有任務
                 with self.continuous_task_lock:
                     task_count = len(self.continuous_tasks)
+                    if task_count == 0:
+                        return {
+                            "status": "success",
+                            "message": "沒有運行中的監測任務",
+                            "type": "stop_monitor"
+                        }
+                        
                     for tid in list(self.continuous_tasks.keys()):
                         self._stop_continuous_task(tid)
                         
@@ -1034,7 +1163,7 @@ class MainController:
                     # 返回特殊標記，表示已由事件系統處理
                     return {"status": "success", "handled_by_event": True}
                     
-            # 停止指定任務
+            # 檢查任務ID是否有效
             with self.continuous_task_lock:
                 if task_id in self.continuous_tasks:
                     self._stop_continuous_task(task_id)
@@ -1045,11 +1174,23 @@ class MainController:
                     # 返回特殊標記，表示已由事件系統處理
                     return {"status": "success", "handled_by_event": True}
                 else:
-                    # 任務不存在時返回錯誤
+                    # 任務不存在時返回更加明確的錯誤信息，包括可用任務列表
+                    error_msg = f"找不到監測任務 {task_id}"
+                    
+                    # 如果有活動任務，則提供任務列表
+                    if active_tasks:
+                        task_ids_str = ", ".join(active_tasks[:5])
+                        if len(active_tasks) > 5:
+                            task_ids_str += f" 等共 {len(active_tasks)} 個任務"
+                        error_msg += f"。當前活動的任務: {task_ids_str}"
+                        
+                    error_msg += "。請使用 'list_monitors' 命令查看所有活動的監測任務。"
+                    
                     return {
                         "status": "error",
-                        "message": f"找不到監測任務 {task_id}",
-                        "type": "stop_monitor"
+                        "message": error_msg,
+                        "type": "stop_monitor",
+                        "available_tasks": active_tasks
                     }
         except Exception as e:
             logger.exception(f"停止監測出錯: {e}")
@@ -1060,12 +1201,12 @@ class MainController:
             }
             
     def _handle_list_monitors(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
-        """處理列出監測任務命令
+        """處理列出監測任務命令，增強任務信息展示
         
         Args:
             params: 命令參數
             source: 命令來源
-            
+                
         Returns:
             處理結果
         """
@@ -1073,6 +1214,10 @@ class MainController:
         
         with self.continuous_task_lock:
             for task_id, task_info in self.continuous_tasks.items():
+                # 增加更多任務詳情
+                elapsed_time = time.time() - task_info.get("start_time", time.time())
+                elapsed_str = self._format_elapsed_time(elapsed_time)
+                
                 task_data = {
                     "id": task_id,
                     "type": task_info.get("type", "unknown"),
@@ -1080,7 +1225,9 @@ class MainController:
                     "format": task_info.get("format", "text"),
                     "running": task_info.get("running", False),
                     "start_time": task_info.get("start_time", 0),
-                    "elapsed": time.time() - task_info.get("start_time", time.time())
+                    "elapsed": elapsed_time,
+                    "elapsed_formatted": elapsed_str,
+                    "source": str(task_info.get("source", "unknown"))
                 }
                 tasks.append(task_data)
                 
@@ -1089,6 +1236,25 @@ class MainController:
             "task_count": len(tasks),
             "tasks": tasks
         }
+        
+    def _format_elapsed_time(self, seconds: float) -> str:
+        """格式化經過的時間
+        
+        Args:
+            seconds: 經過的秒數
+                
+        Returns:
+            格式化的時間字符串
+        """
+        minutes, seconds = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        
+        if hours > 0:
+            return f"{hours}小時 {minutes}分鐘 {seconds}秒"
+        elif minutes > 0:
+            return f"{minutes}分鐘 {seconds}秒"
+        else:
+            return f"{seconds}秒"
 
     def _trigger_monitor_event(self, task_id: str, interval: float, format_type: str) -> None:
         """觸發監測啟動事件"""
@@ -1149,32 +1315,81 @@ class MainController:
         
         if not encoder_tasks and self.encoder_controller:
             self.encoder_controller.stop_monitoring()
-            
+
+           
+    def _handle_get_device_info(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
+        """處理獲取設備信息命令"""
+        device_config = self.config_manager.config.get('device', {})
+        device_name = device_config.get('name', 'encoder-pi')
+        device_id = device_config.get('id', '001')
+        
+        return {
+            "status": "success",
+            "type": "device_info",
+            "device_name": f"{device_name}-{device_id}",
+            "name": device_name,                        
+            "id": device_id,
+            "timestamp": time.time()
+        }
+    
     
     def _on_encoder_data_update(self, data: Dict[str, Any]) -> None:
-        """編碼器資料更新事件處理器
+        """編碼器資料更新事件處理器，增加重複數據檢測
         
         Args:
             data: 事件資料
         """
         if not self.osc_server:
             return
-                
+
+        # 從配置管理器獲取設備名稱
+        device_config = self.config_manager.config.get('device', {})
+        device_name = device_config.get('name', 'encoder-pi')
+        device_id = device_config.get('id', '001')
+        full_device_name = f"{device_name}-{device_id}"
+
+        # 添加設備名稱到數據中
+        if "device_name" not in data:
+            data["device_name"] = full_device_name
+            
+        # 生成數據指紋用於重複數據檢測
+        # 使用角度、速度和圈數作為關鍵數據點
+        data_fingerprint = (
+            data.get("angle", 0),
+            data.get("rpm", 0),
+            data.get("laps", 0)
+        )
+
         # 發送到所有任務目標
         with self.continuous_task_lock:
-            for task_id, task_info in self.continuous_tasks.items():
+            for task_id, task_info in list(self.continuous_tasks.items()):
                 if not task_info.get("running", False):
                     continue
                     
                 source = task_info.get("source")
-                format_type = task_info.get("format", "text")
+                if not source:
+                    continue
+                    
+                format_type = task_info.get("format", "osc")
+                
+                # 檢查是否為重複數據 (同一任務在短時間內發送相同數據)
+                last_data = task_info.get("last_data")
+                last_sent_time = task_info.get("last_sent_time", 0)
+                current_time = time.time()
+                
+                # 如果是相同數據且時間間隔小於間隔的一半，則跳過發送
+                min_interval = task_info.get("interval", 0.5) / 2
+                if (last_data == data_fingerprint and 
+                    (current_time - last_sent_time) < min_interval):
+                    logger.debug(f"跳過重複數據: 任務={task_id}, 時間間隔={current_time - last_sent_time:.3f}秒")
+                    continue
                 
                 # 根據格式類型發送資料
                 if format_type.lower() == "json":
-                    # JSON 格式 - 添加类型标识
                     result = {
                         "type": "monitor_data",
                         "task_id": task_id,
+                        "device_name": full_device_name,
                         "address": data["address"],
                         "timestamp": data["timestamp"],
                         "direction": data["direction"],
@@ -1185,27 +1400,35 @@ class MainController:
                         "raw_rpm": data["raw_rpm"]
                     }
                 elif format_type.lower() == "osc":
-                    # OSC 格式 - 參數列表
-                    result = [
-                        data["timestamp"],     # timestamp
-                        data["raw_angle"],     # position
-                        data["rpm"],           # rpm
-                        data["laps"],          # laps
-                        data["angle"],         # angle
-                        data["direction"]      # dir
-                    ]
-                else:
-                    # 文本格式: <addr>,<timestamp>,<dir>,<angle>,<rpm>,<laps>,<raw_angle>,<raw_rpm>
-                    # Check if rpm or raw_rpm is None and provide default values
+                    # OSC 格式 - 使用修改後的格式，設備名稱在地址中
                     rpm_value = data['rpm'] if data['rpm'] is not None else 0
                     raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
                     
-                    result = f"{data['address']},{data['timestamp']:.3f},{data['direction']},{data['angle']:.4f},{rpm_value:.4f},{data['laps']},{data['raw_angle']},{raw_rpm_value}\n"
-                        
+                    result = [
+                        data["address"],         # 地址
+                        data["timestamp"],       # 時間戳
+                        data["direction"],       # 方向
+                        data["angle"],           # 角度
+                        rpm_value,               # 轉速
+                        data["laps"],            # 圈數
+                        data["raw_angle"],       # 原始角度
+                        raw_rpm_value            # 原始轉速
+                    ]
+                else:
+                    # 文本格式: 使用空格分隔
+                    rpm_value = data['rpm'] if data['rpm'] is not None else 0
+                    raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
+                    
+                    result = f"{data['address']} {data['timestamp']:.3f} {data['direction']} {data['angle']:.4f} {rpm_value:.4f} {data['laps']} {data['raw_angle']} {raw_rpm_value}\n"
+
                 # 發送資料
                 if source:
                     # 廣播到所有客户端
                     self.osc_server.broadcast("/encoder/monitor_data", result)
+                    
+                    # 更新最後發送的數據和時間
+                    task_info["last_data"] = data_fingerprint
+                    task_info["last_sent_time"] = current_time
                     
     def _on_encoder_zero_set(self, data: Dict[str, Any]) -> None:
         """編碼器零點設置事件處理器
@@ -1329,6 +1552,41 @@ class MainController:
         
         return {"status": "error", "message": "操作多次重試後仍然失敗"}
     
+    def check_threads_status(self) -> Dict[str, Any]:
+        """檢查所有線程狀態
+        
+        Returns:
+            線程狀態字典
+        """
+        threads_status = {}
+        
+        # 檢查 OSC 服務器線程
+        if self.osc_server:
+            threads_status["osc_server"] = {
+                "server_thread": self.osc_server.server_thread and self.osc_server.server_thread.is_alive(),
+                "send_thread": self.osc_server.send_thread and self.osc_server.send_thread.is_alive(),
+                "heartbeat_thread": self.osc_server.heartbeat_thread and self.osc_server.heartbeat_thread.is_alive(),
+            }
+        
+        # 檢查編碼器監測線程
+        if self.encoder_controller:
+            threads_status["encoder"] = {
+                "monitoring_thread": self.encoder_controller.monitoring_thread and self.encoder_controller.monitoring_thread.is_alive(),
+                "connection_monitor": self.encoder_controller.connection_monitor is not None
+            }
+            
+        # 檢查連續監測任務線程
+        continuous_tasks = []
+        with self.continuous_task_lock:
+            for task_id, task_info in self.continuous_tasks.items():
+                continuous_tasks.append({
+                    "id": task_id,
+                    "running": task_info.get("running", False)
+                })
+        
+        threads_status["continuous_tasks"] = continuous_tasks
+        return threads_status
+    
     def _send_gpio_response(self, result: Dict[str, Any], gpio_type: str) -> Dict[str, Any]:
         """統一處理 GPIO 回應並廣播
         
@@ -1342,6 +1600,13 @@ class MainController:
         # 添加類型標識
         if "type" not in result:
             result["type"] = gpio_type
+
+        # 添加設備名稱
+        if "device_name" not in result:
+            device_config = self.config_manager.config.get('device', {})
+            device_name = device_config.get('name', 'encoder-pi')
+            device_id = device_config.get('id', '001')
+            result["device_name"] = f"{device_name}-{device_id}"
             
         # 使用 broadcast 發送
         if self.osc_server:
@@ -1363,6 +1628,13 @@ class MainController:
         # 添加類型標識
         if "type" not in result:
             result["type"] = encoder_type
+
+        # 添加設備名稱
+        if "device_name" not in result:
+            device_config = self.config_manager.config.get('device', {})
+            device_name = device_config.get('name', 'encoder-pi')
+            device_id = device_config.get('id', '001')
+            result["device_name"] = f"{device_name}-{device_id}"
             
         # 使用 broadcast 發送
         if self.osc_server:

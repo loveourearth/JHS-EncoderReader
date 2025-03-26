@@ -1,8 +1,7 @@
 """
-OSC服務器模組
+OSC服務器模組的改進版本
 
-處理OSC通訊，接收和發送OSC消息
-提供網絡接口以控制系統
+統一地址格式，增強線程管理和資源釋放機制
 """
 import logging
 import threading
@@ -123,6 +122,8 @@ class OSCServer:
         # 客戶端記錄
         self.clients = {}
         self.last_client_address = None
+        self.heartbeat_interval = 240
+        self.heartbeat_thread = None
         
         # 設置默認處理器
         self.dispatcher.set_default_handler(self._default_handler)
@@ -136,11 +137,20 @@ class OSCServer:
         self.dispatcher.map("/encoder/set_zero", self._encoder_set_zero_handler)
         self.dispatcher.map("/encoder/start_monitor", self._encoder_start_monitor_handler)
         self.dispatcher.map("/encoder/stop_monitor", self._encoder_stop_monitor_handler)
+        self.dispatcher.map("/encoder/list_monitors", self._encoder_list_monitors_handler)
+        
         # 添加GPIO處理器
         self.dispatcher.map("/gpio", self._gpio_handler)
+    
+        # 註冊whoami處理器
+        self.dispatcher.map("/whoami", self._whoami_handler)
         
         # 添加鎖保護
         self.clients_lock = threading.RLock() 
+        
+        # 停止事件flags
+        self.stop_send_event = threading.Event()
+        self.stop_heartbeat_event = threading.Event()
         
         # 啟動發送執行緒
         self._start_send_thread()
@@ -151,14 +161,22 @@ class OSCServer:
         """啟動後台發送執行緒"""
         if self.send_thread and self.send_thread.is_alive():
             return
-            
-        self.send_thread = threading.Thread(target=self._send_worker)
+
+        # 確保停止事件是cleared狀態
+        self.stop_send_event.clear()
+        
+        self.send_thread = threading.Thread(
+            target=self._send_worker,
+            name="OSCSendThread"
+        )
         self.send_thread.daemon = True
         self.send_thread.start()
+        logger.info("OSC發送線程已啟動")
 
     def _send_worker(self):
         """發送執行緒工作函數"""
-        while self.running:
+        logger.debug("發送線程開始運行")
+        while not self.stop_send_event.is_set() and self.running:
             try:
                 # 從隊列獲取消息，最多等待1秒
                 try:
@@ -182,19 +200,39 @@ class OSCServer:
             except Exception as e:
                 logger.error(f"發送執行緒出錯: {e}")
                 time.sleep(0.1)  # 避免CPU過載
-    
+        
+        logger.debug("發送線程已終止")
     
     def _send_data(self, client_address, data, format_type):
         """實際發送數據
         
+        將數據格式從逗號分隔修改為空格分隔
+        
+        Args:
+            client_address: 客戶端地址
+            data: 要發送的數據
+            format_type: 數據格式
+            
         Returns:
             是否發送成功
         """
+        # 添加對None客戶端地址的檢查
+        if client_address is None:
+            logger.error("客戶端地址為空，無法發送數據")
+            self.error_count += 1
+            return False
+            
         try:
             # 確保使用正確的返回端口
             if isinstance(client_address, tuple) and len(client_address) == 2:
                 # 保留IP地址，修改端口為返回端口
                 client_address = (client_address[0], self.return_port)
+                
+            # 檢查客戶端地址的有效性
+            if not isinstance(client_address[0], str) or not isinstance(client_address[1], int):
+                logger.error(f"客戶端地址格式無效: {client_address}")
+                self.error_count += 1
+                return False
                 
             # 創建OSC客戶端
             client = udp_client.SimpleUDPClient(
@@ -202,128 +240,154 @@ class OSCServer:
                 client_address[1]
             )
             
-            # 根據格式發送數據
+            # 獲取設備名稱
+            device_name = "unknown"
+            if isinstance(data, dict) and "device_name" in data:
+                device_name = data.get("device_name")
+            else:
+                # 嘗試從配置中獲取設備名稱
+                device_config = self.command_handler({"command": "get_device_info"}, None) if self.command_handler else None
+                if device_config and "device_name" in device_config:
+                    device_name = device_config["device_name"]
+            
+            if isinstance(data, dict) and "timestamp" in data:
+                logger.debug(f"發送前的時間戳: {data['timestamp']}")
+            
+            # 根據格式發送數據，使用統一的地址格式: /{device_name}/{command_type}
             if format_type.lower() == "json":
-                # 發送JSON數據
-                address = "/response"
+                # 確定正確的地址前缀
+                address = f"/{device_name}/response"
                 
-                # 從數據中獲取更精確的地址
+                # 根據數據類型確定更具體的地址
                 if isinstance(data, dict):
                     if "type" in data:
                         if data["type"] == "monitor_data":
-                            address = "/encoder/data"
+                            address = f"/{device_name}/encoder/data"
                         elif data["type"] == "zero_set":
-                            address = "/encoder/zero_set"
+                            address = f"/{device_name}/encoder/zero_set"
                         elif data["type"] == "start_monitor":
-                            address = "/encoder/start_monitor"
+                            address = f"/{device_name}/encoder/monitor/start"
                         elif data["type"] == "stop_monitor":
-                            address = "/encoder/stop_monitor"
+                            address = f"/{device_name}/encoder/monitor/stop"
                         elif data["type"] == "monitor_error":
-                            address = "/encoder/error"
+                            address = f"/{device_name}/encoder/error"
+                        else:
+                            # 使用type值作為地址的一部分
+                            address = f"/{device_name}/{data['type']}"
                     elif "command" in data:
                         cmd = data.get("command", "")
                         if cmd.startswith("gpio_"):
-                            address = "/gpio/response"
+                            address = f"/{device_name}/gpio/response"
                         elif cmd == "read_input":
-                            address = "/gpio/input"
+                            address = f"/{device_name}/gpio/input"
                 
-                # 轉換為JSON字符串
-                if isinstance(data, (dict, list)):
-                    json_data = json.dumps(data)
-                else:
-                    json_data = str(data)
-                    
-                client.send_message(address, json_data)
-                
-            elif format_type.lower() == "osc":
-                # 發送OSC格式數據
-                if isinstance(data, list):
-                    # 使用固定格式的OSC消息，將列表作為參數發送
-                    client.send_message("/encoder/data", data)
-                elif isinstance(data, dict):
-                    # 將字典轉換為OSC參數列表
-                    address = "/response"
-                    
-                    if "type" in data:
-                        if data["type"] == "monitor_data":
-                            address = "/encoder/data"
-                            # Extract monitoring data in a specific order for OSC
-                            # Order: timestamp, position, speed, laps, angle, direction
-                            params = [
-                                data.get("timestamp", time.time()),
-                                data.get("raw_angle", 0),
-                                data.get("rpm", 0),
-                                data.get("laps", 0),
-                                data.get("angle", 0),
-                                data.get("direction", 0)
-                            ]
-                            client.send_message(address, params)
-                            return True
-                        elif data["type"] == "zero_set":
-                            address = "/encoder/zero_set"
-                        elif data["type"] == "start_monitor":
-                            address = "/encoder/start_monitor"
-                        elif data["type"] == "stop_monitor":
-                            address = "/encoder/stop_monitor"
-                        elif data["type"] == "monitor_error":
-                            address = "/encoder/error"
-                    elif "command" in data:
-                        cmd = data.get("command", "")
-                        if cmd.startswith("gpio_"):
-                            address = "/gpio/response"
-                        elif cmd == "read_input":
-                            address = "/gpio/input"
-                            
-                    # For general responses, extract common fields
-                    status = data.get("status", "unknown")
-                    message = data.get("message", "")
-                    
-                    # For specific response types, include relevant data
-                    if address == "/gpio/input":
-                        params = [status, data.get("pin", 0), data.get("state", False)]
-                    elif address.startswith("/gpio"):
-                        params = [status, message]
+                # 轉換為JSON字符串，增加容錯性
+                try:
+                    if isinstance(data, (dict, list)):
+                        json_data = json.dumps(data)
                     else:
-                        # Default parameter list
+                        json_data = str(data)
+                        
+                    client.send_message(address, json_data)
+                    logger.debug(f"發送JSON數據到: {address}")
+                except (TypeError, ValueError) as e:
+                    logger.error(f"JSON數據格式錯誤: {e}, 數據: {str(data)[:100]}...")
+                    self.error_count += 1
+                    return False
+                    
+            elif format_type.lower() == "osc":
+                # 使用統一的地址格式
+                if isinstance(data, list):
+                    # 新格式: /{device_name}/encoder/data
+                    address = f"/{device_name}/encoder/data"
+                    client.send_message(address, data)
+                    logger.debug(f"發送OSC數據到: {address}")
+                    
+                elif isinstance(data, dict):
+                    if "type" in data and data["type"] == "monitor_data":
+                        # 監測數據特殊處理
+                        address = f"/{device_name}/encoder/data"
+                        
+                        # 構建參數列表，移除設備名稱
+                        rpm_value = data.get("rpm", 0) if data.get("rpm") is not None else 0
+                        raw_rpm_value = data.get("raw_rpm", 0) if data.get("raw_rpm") is not None else 0
+                        
+                        params = [
+                            data.get("address", 0),            # 地址
+                            data.get("timestamp", time.time()),# 時間戳
+                            data.get("direction", 0),          # 方向
+                            data.get("angle", 0),              # 角度
+                            rpm_value,                         # 轉速
+                            data.get("laps", 0),               # 圈數
+                            data.get("raw_angle", 0),          # 原始角度
+                            raw_rpm_value                      # 原始轉速
+                        ]
+                        client.send_message(address, params)
+                        logger.debug(f"發送OSC監測數據到: {address}")
+                        return True
+                    else:
+                        # 其他類型的字典數據
+                        address = f"/{device_name}/response"
+                        if "type" in data:
+                            type_value = data["type"]
+                            address = f"/{device_name}/{type_value}"
+                        
+                        # 提取常見字段
+                        status = data.get("status", "unknown")
+                        message = data.get("message", "")
+                        
+                        # 構建參數列表
                         params = [status]
                         if message:
                             params.append(message)
                         
-                        # Add other values from the dictionary
-                        for key, value in data.items():
-                            if key not in ["status", "message", "type", "command"]:
-                                params.append(key)
-                                params.append(value)
-                    
-                    client.send_message(address, params)
+                        client.send_message(address, params)
+                        logger.debug(f"發送OSC回應到: {address}")
                 else:
                     # 其他類型數據直接發送
-                    client.send_message("/data", data)
-                    
+                    client.send_message(f"/{device_name}/data", data)
+                    logger.debug(f"發送其他OSC數據到: /{device_name}/data")
+                        
             else:  # 文本格式
-                # 如果是編碼器數據，使用CSV格式
+                # 統一地址格式為 /{device_name}/text
+                address = f"/{device_name}/text"
+                
+                # 如果是編碼器數據，使用統一的格式
                 if isinstance(data, dict) and data.get("type") == "monitor_data":
-                    # Format CSV string: addr,timestamp,dir,angle,rpm,laps,raw_angle,raw_rpm
+                    # 構建空格分隔的文本數據
                     addr = data.get("address", 0)
                     timestamp = data.get("timestamp", time.time())
                     direction = data.get("direction", 0)
                     angle = data.get("angle", 0)
-                    rpm = data.get("rpm", 0)
+                    rpm = data.get("rpm", 0) if data.get("rpm") is not None else 0
                     laps = data.get("laps", 0)
                     raw_angle = data.get("raw_angle", 0)
-                    raw_rpm = data.get("raw_rpm", 0)
+                    raw_rpm = data.get("raw_rpm", 0) if data.get("raw_rpm") is not None else 0
                     
-                    csv_data = f"{addr},{timestamp:.3f},{direction},{angle:.4f},{rpm:.4f},{laps},{raw_angle},{raw_rpm}"
-                    client.send_message("/encoder/csv", csv_data)
-                elif isinstance(data, str) and "," in data:
-                    # 已經是CSV格式
-                    parts = data.strip().split(",")
-                    if len(parts) >= 8:
-                        # 發送到特定地址
-                        client.send_message("/encoder/csv", data)
+                    text_data = f"{addr} {timestamp:.3f} {direction} {angle:.4f} {rpm:.4f} {laps} {raw_angle} {raw_rpm}"
+                    client.send_message(address, text_data)
+                    logger.debug(f"發送文本監測數據到: {address}")
+                elif isinstance(data, str):
+                    # 檢查是否為原先的逗號分隔格式
+                    if "," in data:
+                        # 將逗號分隔轉換為空格分隔
+                        parts = data.strip().split(",")
+                        if len(parts) >= 8:
+                            # 發送到特定地址
+                            address = f"/{device_name}/text"
+                            data_without_device = " ".join(parts) 
+                            client.send_message(address, data_without_device)
+                            logger.debug(f"發送轉換文本數據到: {address}")
+                        else:
+                            # 作為純文本發送
+                            address = f"/{device_name}/text"
+                            client.send_message(address, data)
+                            logger.debug(f"發送純文本數據到: {address}")
                     else:
-                        # 作為純文本發送
-                        client.send_message("/text", data)
+                        # 直接發送原文本
+                        address = f"/{device_name}/text"
+                        client.send_message(address, data)
+                        logger.debug(f"發送原始文本數據到: {address}")
                 else:
                     # 將數據轉換為字符串
                     if isinstance(data, (dict, list)):
@@ -332,16 +396,90 @@ class OSCServer:
                         text_data = str(data)
                         
                     # 發送文本數據
-                    client.send_message("/text", text_data)
-                    
+                    address = f"/{device_name}/text"
+                    client.send_message(address, text_data)
+                    logger.debug(f"發送格式化文本數據到: {address}")
+            
+            # 更新計數器
             self.tx_count += 1
             logger.debug(f"成功發送數據到 {client_address}")
             return True
+        except ConnectionRefusedError:
+            # 特別處理連線被拒絕的情況
+            logger.warning(f"連線被拒絕: {client_address}，可能客戶端已關閉")
             
+            # 從客戶端列表中移除
+            self._remove_disconnected_client(client_address)
+            self.error_count += 1
+            return False
+        except OSError as e:
+            # 處理網絡相關錯誤
+            logger.error(f"網絡錯誤: {e}")
+            if "No route to host" in str(e) or "Network is unreachable" in str(e):
+                self._remove_disconnected_client(client_address)
+            self.error_count += 1
+            return False
         except Exception as e:
             logger.error(f"發送數據出錯: {e}")
             self.error_count += 1
             return False
+
+
+    def _remove_disconnected_client(self, client_address):
+        """移除已斷開連接的客戶端
+        
+        Args:
+            client_address: 客戶端地址
+        """
+        with self.clients_lock:
+            client_key = f"{client_address[0]}:{client_address[1]}"
+            if client_key in self.clients:
+                logger.info(f"移除無法連線的客戶端: {client_address}")
+                del self.clients[client_key]
+                
+                # 檢查是否有需要通知的其他客戶端
+                if len(self.clients) > 0 and self.running:
+                    # 通知其他客戶端有客戶端斷開
+                    try:
+                        notification = {
+                            "type": "client_disconnected",
+                            "timestamp": time.time(),
+                            "client": client_address[0]
+                        }
+                        # 只向訂閱了系統事件的客戶端發送通知
+                        for ck, client_info in self.clients.items():
+                            if "subscribe" in client_info and "system" in client_info["subscribe"]:
+                                self.send_response(notification, client_info["address"], "json")
+                    except Exception as e:
+                        logger.error(f"發送客戶端斷開通知時出錯: {e}")
+
+
+    def _encoder_list_monitors_handler(self, address: str, *args) -> None:
+        """編碼器列出監測任務處理器
+        
+        Args:
+            address: OSC地址
+            *args: OSC參數
+        """
+        command = {"command": "list_monitors"}
+        
+        # 獲取當前請求的客戶端地址
+        client_address = self.context.get_client()
+        if client_address:
+            self._update_client(client_address)
+        
+        # 調用命令處理函數
+        if self.command_handler and client_address:
+            result = self.command_handler(command, client_address)
+            # 發送回應
+            if result:
+                # 使用客戶端偏好的格式，如果未指定則使用json
+                client_key = f"{client_address[0]}:{client_address[1]}"
+                format_type = "json"
+                if client_key in self.clients and "format" in self.clients[client_key]:
+                    format_type = self.clients[client_key]["format"]
+                    
+                self.send_response(result, client_address, format_type)
         
     def start(self) -> bool:
         """啟動OSC服務器
@@ -368,6 +506,9 @@ class OSCServer:
             self.server_thread.daemon = True
             self.server_thread.start()
             
+            # 啟動心跳線程
+            self._start_heartbeat()
+            
             logger.info(f"OSC服務器已啟動在 {self.host}:{self.port}")
             return True
             
@@ -375,33 +516,99 @@ class OSCServer:
             logger.error(f"啟動OSC服務器出錯: {e}")
             self.running = False
             return False
+
+    def _start_heartbeat(self):
+        """啟動心跳機制以保持連線活躍"""
+        def heartbeat_task():
+            while self.running:
+                try:
+                    # 使用合理的間隔（修改自 240 秒到 120 秒）
+                    time.sleep(self.heartbeat_interval)
+                    if not self.running:  # 重要：確保在等待期間沒有停止運行
+                        break
+                        
+                    # 獲取設備名稱（原有邏輯）
+                    device_info = None
+                    if self.command_handler:
+                        try:
+                            device_info = self.command_handler({"command": "get_device_info"}, None)
+                        except Exception as e:
+                            logger.error(f"獲取設備資訊出錯: {e}")
+                    
+                    # 構建心跳數據（加入更多系統健康資訊）
+                    heartbeat_data = {
+                        "type": "heartbeat",
+                        "timestamp": time.time(),
+                        "device_name": device_info.get("device_name", "unknown") if device_info else "unknown",
+                        "status": "ok"  # 可從 command_handler 獲取更詳細狀態
+                    }
+                    
+                    # 使用統一的地址發送心跳
+                    success_count = self.broadcast("/system/heartbeat", heartbeat_data)
+                    logger.debug(f"已發送心跳包到 {success_count} 個客戶端")
+                except Exception as e:
+                    logger.error(f"心跳任務出錯: {e}")
+                    # 不中斷循環，保證心跳持續運行
+
+        # 啟動心跳線程（保持原有實現）
+        self.heartbeat_thread = threading.Thread(target=heartbeat_task, name="HeartbeatThread")
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
             
-    def stop(self) -> None:
+    def stop(self):
         """停止OSC服務器"""
         if not self.running:
             return
             
         logger.info("正在停止OSC服務器...")
-        self.running = False  # 首先標記為不再運行
+        self.running = False  # 先將運行標誌設為 False
+
+        # 先設置心跳停止事件，讓心跳線程能更快終止
+        self.stop_heartbeat_event.set()
         
-        # 關閉服務器
+        # 停止心跳線程
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            try:
+                logger.debug("等待心跳線程終止...")
+                self.heartbeat_thread.join(timeout=2.0)
+                if self.heartbeat_thread.is_alive():
+                    logger.warning("心跳線程無法在 2 秒內終止，繼續執行")
+            except Exception as e:
+                logger.error(f"等待心跳線程終止時出錯: {e}")
+        
+        # 停止發送線程
+        if self.send_thread and self.send_thread.is_alive():
+            try:
+                logger.debug("等待發送線程終止...")
+                self.send_thread.join(timeout=2.0)
+                if self.send_thread.is_alive():
+                    logger.warning("發送線程無法在 2 秒內終止，繼續執行")
+            except Exception as e:
+                logger.error(f"等待發送線程終止時出錯: {e}")
+        
+        # 關閉服務器 (使用超時機制)
         if self.server:
             try:
-                # 使用超時機制避免卡住
-                stop_thread = threading.Thread(target=self._stop_server)
+                logger.debug("正在關閉OSC服務器底層服務...")
+                stop_thread = threading.Thread(target=self._stop_server, name="StopServerThread")
                 stop_thread.daemon = True
                 stop_thread.start()
-                stop_thread.join(timeout=2.0)  # 最多等待2秒
+                stop_thread.join(timeout=3.0)
+                if stop_thread.is_alive():
+                    logger.warning("關閉OSC服務器底層服務超時")
             except Exception as e:
                 logger.error(f"關閉OSC服務器出錯: {e}")
-                
-        # 等待線程結束，帶超時
+        
+        # 等待服務器線程終止
         if self.server_thread and self.server_thread.is_alive():
             try:
-                self.server_thread.join(timeout=2.0)
-            except Exception:
-                logger.warning("OSC服務器線程無法正常終止")
-                
+                logger.debug("等待服務器線程終止...")
+                self.server_thread.join(timeout=3.0)
+                if self.server_thread.is_alive():
+                    logger.warning("OSC服務器線程無法在 3 秒內終止")
+            except Exception as e:
+                logger.error(f"等待服務器線程終止時出錯: {e}")
+        
         logger.info("OSC服務器已停止")
         
     def _stop_server(self):
@@ -735,7 +942,7 @@ class OSCServer:
         try:
             # 構造命令
             interval = float(args[0]) if len(args) > 0 else 0.5
-            format_type = args[1] if len(args) > 1 else "text"
+            format_type = args[1] if len(args) > 1 else "osc"
             
             # 驗證間隔
             if interval < 0.1:
@@ -751,7 +958,7 @@ class OSCServer:
                 
             # 驗證格式
             if format_type.lower() not in ["text", "json", "osc"]:
-                format_type = "text"  # 無效格式使用默認值
+                format_type = "osc"  # 無效格式使用默認值
                 
             command = {
                 "command": "start_monitor",
@@ -987,6 +1194,51 @@ class OSCServer:
             }
             if client_address:
                 self.send_response(error_response, client_address)
+
+    def _whoami_handler(self, address: str, *args) -> None:
+        """處理whoami命令，返回設備標識信息"""
+        logger.debug(f"收到whoami請求: {address} {args}")
+        self.rx_count += 1
+        
+        # 獲取當前請求的客戶端地址
+        client_address = self.context.get_client()
+        if client_address:
+            self._update_client(client_address)
+        
+        # 獲取設備名稱
+        device_name = None
+        if hasattr(self, 'command_handler') and self.command_handler:
+            try:
+                # 嘗試從主控制器獲取設備名稱
+                result = self.command_handler({"command": "get_device_info"}, client_address)
+                if result and isinstance(result, dict) and "device_name" in result:
+                    device_name = result["device_name"]
+            except Exception as e:
+                logger.error(f"獲取設備名稱出錯: {e}")
+        
+        # 如果無法從主控制器獲取，嘗試直接從配置獲取
+        if not device_name:
+            try:
+                from ..utils.config import ConfigManager
+                config = ConfigManager()
+                device_name = config.get_device_name()
+            except Exception as e:
+                logger.error(f"從配置獲取設備名稱出錯: {e}")
+                device_name = "encoder-pi"  # 默認值
+        
+        # 構造回應
+        response = {
+            "status": "success",
+            "type": "device_info",
+            "device_name": device_name,
+            "host": self.host,
+            "port": self.port,
+            "timestamp": time.time()
+        }
+        
+        # 發送回應
+        if client_address:
+            self.send_response(response, client_address, "json")
                 
     def _update_client(self, client_address: Tuple[str, int]) -> None:
         """更新客戶端記錄
@@ -1019,7 +1271,7 @@ class OSCServer:
     def _cleanup_clients(self) -> None:
         """清理過期客戶端"""
         current_time = time.time()
-        expired_time = 300  # 5分鐘無活動視為過期
+        expired_time = 900
         
         expired_keys = []
         for client_key, client_info in self.clients.items():
@@ -1067,25 +1319,27 @@ class OSCServer:
     
 
     def broadcast(self, address: str, data: Any) -> int:
-        """廣播消息給所有客戶端
+        """廣播消息給所有客戶端，增強版
         
         Args:
             address: OSC地址
             data: 要發送的數據
-            
+                
         Returns:
             成功發送的客戶端數量
         """
         success_count = 0
+        failed_clients = []
         current_time = time.time()
+        expired_time = 300  # 5分鐘無活動視為過期
 
         with self.clients_lock:  # 使用鎖保護
             # 遍歷所有客戶端
             for client_key, client_info in list(self.clients.items()):
-                # 檢查是否過期（超過30秒未見則視為過期）
-                if current_time - client_info["last_seen"] > 30:
+                # 檢查是否過期
+                if current_time - client_info["last_seen"] > expired_time:
                     logger.debug(f"移除過期客戶端: {client_info['address']}")
-                    del self.clients[client_key]
+                    failed_clients.append(client_key)
                     continue
 
                 # 發送數據
@@ -1094,40 +1348,25 @@ class OSCServer:
                     client_addr = client_info["address"]
                     client_addr = (client_addr[0], self.return_port)
                     
-                    client = udp_client.SimpleUDPClient(
-                        client_addr[0], 
-                        client_addr[1]
-                    )
-
-                    # 改進的類型處理
-                    if isinstance(data, dict):
-                        # 轉換為 JSON 字符串，始終作為單一字符串發送
-                        json_data = json.dumps(data)
-                        client.send_message(address, json_data)
-                    elif isinstance(data, list):
-                        # 對於列表，確保所有元素都是基本類型
-                        # 並且確保整個列表作為單一參數發送（而不是拆分）
-                        typed_data = []
-                        for item in data:
-                            if isinstance(item, (int, float, bool)):
-                                typed_data.append(item)
-                            else:
-                                # 所有非基本類型都轉為字符串
-                                typed_data.append(str(item))
-                        client.send_message(address, typed_data)
+                    # 使用_send_data統一處理發送邏輯
+                    if self._send_data(client_addr, data, 
+                                    client_info.get("format", "json")):
+                        success_count += 1
                     else:
-                        # 所有其他類型轉為字符串
-                        client.send_message(address, str(data))
-
-                    success_count += 1
-                    self.tx_count += 1
-                    logger.debug(f"成功廣播至 {client_addr}: {address}")
-
+                        # 如果發送失敗，記錄失敗的客戶端
+                        failed_clients.append(client_key)
                 except Exception as e:
                     logger.error(f"廣播消息出錯: {e}")
                     self.error_count += 1
+                    failed_clients.append(client_key)
+            
+            # 移除失敗的客戶端
+            for client_key in failed_clients:
+                if client_key in self.clients:
+                    logger.info(f"從廣播中移除失敗的客戶端: {client_key}")
+                    del self.clients[client_key]
 
-            return success_count
+        return success_count
 
 
     def get_statistics(self) -> Dict[str, int]:

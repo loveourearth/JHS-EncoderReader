@@ -27,7 +27,9 @@
         "port": 8888,
         "return_port": 9999,
         "enabled": true,
-        "default_format": "osc"
+        "default_format": "osc",
+        "heartbeat_interval": 120,
+        "heartbeat_enabled": true 
     },
     "logging": {
         "level": "INFO",
@@ -40,7 +42,10 @@
         "max_retries": 3,
         "retry_interval": 5,
         "auto_reconnect": true,
-        "health_check_interval": 30,
         "logging_interval": 300
+    },
+    "device": {
+        "name": "encoder-pi",
+        "id": "001"
     }
 }

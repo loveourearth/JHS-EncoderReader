@@ -13,9 +13,99 @@ from typing import Dict, Any, Optional, Union, Tuple, List, Callable, Awaitable
 from ..modbus.client import ModbusClient
 from ..modbus.registers import RegisterAddress
 from ..utils.monitoring import ConnectionMonitor
+from ..utils.error_handling import execute_with_retry, safe_call, DeviceError
 
 # 配置日誌
 logger = logging.getLogger(__name__)
+
+class ResourceManager:
+    """資源管理器類，使用引用計數管理共享資源"""
+    
+    def __init__(self):
+        """初始化資源管理器"""
+        self.resources = {}
+        self.lock = threading.RLock()
+        
+    def acquire(self, resource_name: str, creator: Callable = None) -> Any:
+        """獲取資源，如果不存在則創建
+        
+        Args:
+            resource_name: 資源名稱
+            creator: 資源創建函數
+            
+        Returns:
+            資源對象
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                if creator is None:
+                    raise ValueError(f"資源 {resource_name} 不存在且未提供創建函數")
+                
+                # 創建資源
+                self.resources[resource_name] = {
+                    "object": creator(),
+                    "ref_count": 0,
+                    "create_time": time.time()
+                }
+                
+            # 增加引用計數
+            self.resources[resource_name]["ref_count"] += 1
+            self.resources[resource_name]["last_access"] = time.time()
+            
+            logger.debug(f"獲取資源 {resource_name}，引用計數: {self.resources[resource_name]['ref_count']}")
+            
+            return self.resources[resource_name]["object"]
+            
+    def release(self, resource_name: str, cleanup: Callable = None) -> bool:
+        """釋放資源
+        
+        Args:
+            resource_name: 資源名稱
+            cleanup: 資源清理函數
+            
+        Returns:
+            是否成功釋放
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                logger.warning(f"嘗試釋放不存在的資源: {resource_name}")
+                return False
+                
+            # 減少引用計數
+            self.resources[resource_name]["ref_count"] -= 1
+            ref_count = self.resources[resource_name]["ref_count"]
+            
+            logger.debug(f"釋放資源 {resource_name}，剩餘引用計數: {ref_count}")
+            
+            # 如果引用計數為0，則清理資源
+            if ref_count <= 0:
+                if cleanup:
+                    try:
+                        cleanup(self.resources[resource_name]["object"])
+                    except Exception as e:
+                        logger.error(f"清理資源 {resource_name} 時出錯: {e}")
+                
+                # 移除資源
+                del self.resources[resource_name]
+                logger.info(f"資源 {resource_name} 已清理並移除")
+                
+            return True
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """獲取資源統計信息
+        
+        Returns:
+            資源統計信息字典
+        """
+        with self.lock:
+            stats = {}
+            for name, info in self.resources.items():
+                stats[name] = {
+                    "ref_count": info["ref_count"],
+                    "age": time.time() - info["create_time"],
+                    "last_access": time.time() - info.get("last_access", info["create_time"])
+                }
+            return stats
 
 class EncoderController:
     """編碼器控制器類
@@ -98,22 +188,34 @@ class EncoderController:
                 return False
             
     def disconnect(self) -> None:
-        """斷開與編碼器設備的連接"""
+        """斷開與編碼器設備的連接並清理資源"""
         with self.lock:
-            if self.modbus_client:
-                # 停止連接監視器
-                self._stop_connection_monitor()
-                
-                # 停止監測線程
-                self.stop_monitoring_event.set()
-                if self.monitoring_thread and self.monitoring_thread.is_alive():
+            # 首先停止所有相關的活動
+            self._stop_connection_monitor()
+            self.stop_monitoring()
+            
+            # 等待監測線程終止
+            if self.monitoring_thread and self.monitoring_thread.is_alive():
+                logger.debug("等待監測線程終止...")
+                self.stop_monitoring_event.set()  # 確保停止事件已設置
+                try:
                     self.monitoring_thread.join(timeout=2.0)
-                    
-                # 關閉連接
-                self.modbus_client.close()
-                self.connected = False
-                logger.info("已斷開與編碼器設備的連接")
-                self._trigger_event("on_disconnected", None)
+                    if self.monitoring_thread.is_alive():
+                        logger.warning("監測線程無法在 2 秒內終止")
+                except Exception as e:
+                    logger.error(f"等待監測線程終止時出錯: {e}")
+            
+            # 關閉客戶端連接
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                    logger.info("已關閉 Modbus 客戶端")
+                except Exception as e:
+                    logger.error(f"關閉 Modbus 客戶端出錯: {e}")
+            
+            self.connected = False
+            logger.info("已斷開與編碼器設備的連接")
+            self._trigger_event("on_disconnected", None)
             
     def read_position(self) -> Tuple[bool, Union[int, str]]:
         """讀取編碼器位置
@@ -356,11 +458,11 @@ class EncoderController:
         
         
     def start_monitoring(self, interval: float = 0.5) -> Tuple[bool, Union[Dict[str, Any], str]]:
-        """開始持續監測編碼器資料
+        """增強的監測啟動方法，添加重試和資源鎖
         
         Args:
             interval: 監測間隔時間(秒)
-            
+                
         Returns:
             (成功狀態, 任務信息或錯誤信息)
         """
@@ -368,119 +470,195 @@ class EncoderController:
             return False, "編碼器未連接"
         
         with self.lock:   
+            # 如果監測已經在運行，返回現有的監測信息
             if self.monitoring_thread and self.monitoring_thread.is_alive():
-                return True, {"message": "監測已在運行中"}
+                logger.info("監測已在運行中")
+                return True, {"message": "監測已在運行中", "status": "running"}
                 
+            # 重置停止事件
             self.stop_monitoring_event.clear()
             
+            # 創建監測任務
             def monitoring_task():
+                logger.debug("編碼器監測線程已啟動")
                 consecutive_errors = 0
+                error_threshold = self.max_consecutive_errors
+                last_successful_read = time.time()
+                max_failure_time = 10.0  # 10秒無成功讀取視為失敗
                 
-                while not self.stop_monitoring_event.is_set():
-                    try:
-                        # 讀取編碼器資料
-                        with self.lock:
-                            position = self.modbus_client.read_encoder_position()
-                            if position is None:
-                                consecutive_errors += 1
-                                if consecutive_errors > self.max_consecutive_errors:
-                                    logger.error(f"連續讀取失敗 {consecutive_errors} 次，停止監測")
+                try:
+                    while not self.stop_monitoring_event.is_set():
+                        try:
+                            # 讀取編碼器資料
+                            with self.lock:
+                                # 檢查連接狀態
+                                if not self.connected:
+                                    logger.error("監測過程中檢測到編碼器已斷開連接")
+                                    self._trigger_event("on_monitor_error", {
+                                        "timestamp": time.time(),
+                                        "message": "編碼器已斷開連接"
+                                    })
                                     break
                                     
-                                # 發送錯誤事件
+                                # 讀取位置
+                                position = self.modbus_client.read_encoder_position()
+                                if position is None:
+                                    consecutive_errors += 1
+                                    
+                                    # 檢查連續錯誤是否超過閾值
+                                    if consecutive_errors > error_threshold:
+                                        logger.error(f"連續讀取失敗 {consecutive_errors} 次，停止監測")
+                                        # 發送錯誤事件
+                                        self._trigger_event("on_monitor_error", {
+                                            "timestamp": time.time(),
+                                            "message": f"連續讀取失敗 {consecutive_errors} 次"
+                                        })
+                                        break
+                                        
+                                    # 檢查無成功讀取的時間是否超過閾值
+                                    if time.time() - last_successful_read > max_failure_time:
+                                        logger.error(f"{max_failure_time} 秒內無成功讀取，停止監測")
+                                        self._trigger_event("on_monitor_error", {
+                                            "timestamp": time.time(),
+                                            "message": f"{max_failure_time} 秒內無成功讀取"
+                                        })
+                                        break
+                                    
+                                    # 發送錯誤事件
+                                    self._trigger_event("on_monitor_error", {
+                                        "timestamp": time.time(),
+                                        "message": "讀取位置失敗"
+                                    })
+                                    self.stop_monitoring_event.wait(interval)
+                                    continue
+                                    
+                                # 更新圈數
+                                lap_count = self._update_lap_count(position)
+                                
+                                # 讀取速度
+                                try:
+                                    # 先取得原始速度值
+                                    raw_speed_value = self.modbus_client.read_register(RegisterAddress.ENCODER_ANGULAR_SPEED)
+                                    # 轉換為帶符號數
+                                    if raw_speed_value is not None and raw_speed_value > 32767:
+                                        raw_speed_value = raw_speed_value - 65536
+                                    # 取得計算後的速度值
+                                    speed = self.modbus_client.read_encoder_speed()
+                                except Exception as e:
+                                    logger.error(f"讀取速度出錯: {e}")
+                                    raw_speed_value = None
+                                    speed = None
+                                    
+                                # 重置連續錯誤計數和上次成功讀取時間
+                                consecutive_errors = 0
+                                last_successful_read = time.time()
+                                
+                                # 獲取方向
+                                direction = self.get_direction()
+                                
+                                # 獲取分辨率
+                                resolution = self.modbus_client.encoder_resolution
+                                
+                                # 計算角度 (參考 6.4.1)
+                                angle = position * 360.0 / resolution
+                                
+                                # 角速度已在 ModbusClient.read_encoder_speed 中計算 (參考 6.4.3)
+                            
+                            # 生成資料包
+                            current_time = time.time()
+                            data_package = {
+                                "address": self.modbus_client.slave_address,
+                                "timestamp": current_time,
+                                "direction": direction,
+                                "angle": angle,  # 角度 (0-360度)
+                                "rpm": speed,    # 轉速 (RPM)
+                                "laps": lap_count,
+                                "raw_angle": position,      # 原始角度值
+                                "raw_rpm": raw_speed_value  # 原始速度值
+                            }
+                            
+                            # 觸發資料更新事件
+                            self._trigger_event("on_data_update", data_package)
+                            
+                            # 等待下一次監測 (使用事件等待，可以更快回應停止請求)
+                            self.stop_monitoring_event.wait(interval)
+                            
+                        except Exception as e:
+                            logger.error(f"監測任務出錯: {e}")
+                            consecutive_errors += 1
+                            
+                            if consecutive_errors > error_threshold:
+                                logger.error(f"連續出錯 {consecutive_errors} 次，停止監測")
                                 self._trigger_event("on_monitor_error", {
                                     "timestamp": time.time(),
-                                    "message": "讀取位置失敗"
+                                    "message": f"連續出錯 {consecutive_errors} 次: {e}"
                                 })
-                                self.stop_monitoring_event.wait(interval)
-                                continue
+                                break
                                 
-                            # 更新圈數
-                            lap_count = self._update_lap_count(position)
-                            
-                            # 讀取速度
-                            try:
-                                # 先取得原始速度值
-                                raw_speed_value = self.modbus_client.read_register(RegisterAddress.ENCODER_ANGULAR_SPEED)
-                                # 轉換為帶符號數 - 添加這行
-                                if raw_speed_value is not None and raw_speed_value > 32767:
-                                    raw_speed_value = raw_speed_value - 65536
-                                # 取得計算後的速度值
-                                speed = self.modbus_client.read_encoder_speed()
-                            except Exception:
-                                raw_speed_value = None
-                                speed = None
+                            # 發送錯誤事件
+                            self._trigger_event("on_monitor_error", {
+                                "timestamp": time.time(),
+                                "message": f"監測出錯: {e}"
+                            })
                                 
-                            # 重置連續錯誤計數
-                            consecutive_errors = 0
-                            
-                            # 獲取方向
-                            direction = self.get_direction()
-                            
-                            # 獲取分辨率
-                            resolution = self.modbus_client.encoder_resolution
-                            
-                            # 計算角度 (參考 6.4.1)
-                            angle = position * 360.0 / resolution
-                            
-                            # 角速度已在 ModbusClient.read_encoder_speed 中計算 (參考 6.4.3)
-                        
-                        # 觸發資料更新事件
-                        self._trigger_event("on_data_update", {
-                            "timestamp": time.time(),
-                            "address": self.modbus_client.slave_address,
-                            "direction": direction,
-                            "angle": angle,  # 角度 (0-360度)
-                            "rpm": speed,    # 轉速 (RPM)
-                            "laps": lap_count,
-                            "raw_angle": position,      # 原始角度值
-                            "raw_rpm": raw_speed_value  # 原始速度值
-                        })
-                        
-                        # 等待下一次監測
-                        self.stop_monitoring_event.wait(interval)
-                        
-                    except Exception as e:
-                        logger.error(f"監測任務出錯: {e}")
-                        consecutive_errors += 1
-                        
-                        if consecutive_errors > self.max_consecutive_errors:
-                            logger.error(f"連續出錯 {consecutive_errors} 次，停止監測")
-                            break
-                            
-                        # 等待下一次嘗試
-                        self.stop_monitoring_event.wait(interval)
-                        
-                logger.info("編碼器監測已停止")
-                self._trigger_event("on_monitoring_stopped", None)
+                            # 等待下一次嘗試
+                            self.stop_monitoring_event.wait(interval)
+                finally:
+                    logger.info("編碼器監測已停止")
+                    self._trigger_event("on_monitoring_stopped", {"timestamp": time.time()})
                     
-            self.monitoring_thread = threading.Thread(target=monitoring_task)
+            # 創建並啟動監測線程
+            self.monitoring_thread = threading.Thread(
+                target=monitoring_task,
+                name="EncoderMonitorThread"
+            )
             self.monitoring_thread.daemon = True
             self.monitoring_thread.start()
             
             logger.info(f"編碼器監測已啟動，間隔: {interval}秒")
-            self._trigger_event("on_monitoring_started", {"interval": interval})
+            self._trigger_event("on_monitoring_started", {"interval": interval, "timestamp": time.time()})
             
             return True, {
                 "status": "started",
-                "interval": interval
+                "interval": interval,
+                "start_time": time.time()
             }
             
+            
     def stop_monitoring(self) -> Tuple[bool, Optional[str]]:
-        """停止編碼器監測
+        """增強的停止監測方法，確保監測線程完全終止
         
         Returns:
             (成功狀態, 錯誤信息)
         """
         with self.lock:
             if not self.monitoring_thread or not self.monitoring_thread.is_alive():
+                logger.debug("沒有運行中的監測任務，無需停止")
                 return False, "沒有運行中的監測任務"
                 
-            self.stop_monitoring_event.set()
-            self.monitoring_thread.join(timeout=2.0)
+            logger.info("正在停止編碼器監測...")
             
+            # 通知監測線程停止
+            self.stop_monitoring_event.set()
+            
+            # 等待監測線程終止
+            try:
+                # 使用超時機制
+                self.monitoring_thread.join(timeout=3.0)
+                
+                if self.monitoring_thread.is_alive():
+                    logger.warning("監測線程在3秒內未能正常終止")
+                    return False, "監測線程未能正常終止"
+            except Exception as e:
+                logger.error(f"等待監測線程終止時出錯: {e}")
+                return False, f"等待監測線程終止時出錯: {e}"
+            
+            # 重置監測線程
+            self.monitoring_thread = None
             logger.info("編碼器監測已停止")
+            
             return True, None
+        
         
     def register_event_listener(self, event_name: str, callback: Callable) -> None:
         """註冊事件監聽器
@@ -666,3 +844,186 @@ class EncoderController:
                 self._update_lap_count(position)
                 
             return position if position_success else None, speed if speed_success else None
+
+    def connect_with_retry(self, port: str = "/dev/ttyUSB0", baudrate: int = 9600, address: int = 1, 
+                        enable_monitor: bool = True, max_retries: int = 3) -> bool:
+        """增強的編碼器連接方法，使用重試機制
+        
+        Args:
+            port: 串口設備路徑
+            baudrate: 波特率
+            address: 編碼器地址
+            enable_monitor: 是否啟用連接監視器
+            max_retries: 最大重試次數
+                
+        Returns:
+            是否連接成功
+        """
+        # 定義重試回調
+        def on_retry(retry_count, exception):
+            logger.warning(f"連接編碼器失敗 (嘗試 {retry_count}/{max_retries}): {exception}")
+            # 重置客戶端狀態
+            if hasattr(self, 'modbus_client') and self.modbus_client:
+                safe_call(self.modbus_client.close)
+                # 短暫延遲後重新創建客戶端
+                time.sleep(0.2)
+        
+        # 使用重試執行器
+        try:
+            return execute_with_retry(
+                self._connect_internal,
+                port, baudrate, address, enable_monitor,
+                max_retries=max_retries,
+                on_retry=on_retry,
+                retry_delay=1.0
+            )
+        except Exception as e:
+            logger.error(f"連接編碼器最終失敗: {e}")
+            self._trigger_event("on_connection_failed", str(e))
+            return False
+
+    def _connect_internal(self, port: str, baudrate: int, address: int, enable_monitor: bool) -> bool:
+        """內部連接方法，由connect_with_retry調用
+        
+        Args:
+            port: 串口設備路徑
+            baudrate: 波特率
+            address: 編碼器地址
+            enable_monitor: 是否啟用連接監視器
+                
+        Returns:
+            是否連接成功
+        """
+        with self.lock:
+            try:
+                # 創建Modbus客戶端
+                self.modbus_client = ModbusClient(
+                    port=port,
+                    baudrate=baudrate,
+                    slave_address=address,
+                    debug_mode=False
+                )
+                
+                # 連接設備
+                self.connected = self.modbus_client.connect()
+                
+                if self.connected:
+                    # 連接後重置圈數計數器
+                    self.current_lap_count = 0
+                    self.last_position = None
+                    self.consecutive_errors = 0
+                    
+                    # 設置閾值為編碼器分辨率的一半
+                    self.position_threshold = self.modbus_client.encoder_resolution / 2
+                    
+                    # 啟動連接監視器
+                    if enable_monitor:
+                        self._start_connection_monitor()
+                        
+                    logger.info(f"已成功連接到編碼器設備: 端口={port}, 波特率={baudrate}, 地址={address}")
+                    self._trigger_event("on_connected", None)
+                else:
+                    logger.error("無法連接到編碼器設備")
+                    self._trigger_event("on_connection_failed", "連接失敗")
+                    
+                return self.connected
+                
+            except Exception as e:
+                logger.exception(f"連接編碼器設備時出錯: {e}")
+                self._trigger_event("on_connection_failed", str(e))
+                return False
+
+    def disconnect(self) -> None:
+        """增強的斷開連接方法，確保所有資源正確釋放
+        
+        主要改進：
+        1. 優先停止所有依賴連接的資源
+        2. 使用超時機制確保線程終止
+        3. 完全清理資源
+        """
+        with self.lock:
+            # 首先停止所有相關的活動
+            self._stop_connection_monitor()
+            
+            # 停止監測並等待確認
+            monitoring_stopped = False
+            if hasattr(self, 'monitoring_thread') and self.monitoring_thread and self.monitoring_thread.is_alive():
+                logger.debug("正在停止監測線程...")
+                self.stop_monitoring()
+                try:
+                    # 等待監測線程終止的超時機制
+                    start_time = time.time()
+                    max_wait = 3.0  # 最多等待3秒
+                    
+                    while self.monitoring_thread.is_alive() and (time.time() - start_time) < max_wait:
+                        time.sleep(0.1)
+                        
+                    if not self.monitoring_thread.is_alive():
+                        monitoring_stopped = True
+                        logger.debug("監測線程已成功終止")
+                    else:
+                        logger.warning(f"監測線程在 {max_wait} 秒內未能終止")
+                except Exception as e:
+                    logger.error(f"等待監測線程終止時出錯: {e}")
+            else:
+                monitoring_stopped = True
+                
+            # 關閉Modbus客戶端連接
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                    logger.info("已關閉 Modbus 客戶端")
+                    self.modbus_client = None
+                except Exception as e:
+                    logger.error(f"關閉 Modbus 客戶端出錯: {e}")
+            
+            # 更新連接狀態
+            self.connected = False
+            
+            # 觸發斷開連接事件
+            self._trigger_event("on_disconnected", 
+                            {"status": "success",
+                            "monitoring_clean_stop": monitoring_stopped,
+                            "timestamp": time.time()}) 
+        
+class ThreadSafeEncoderController:
+    """線程安全的編碼器控制器，提供自動資源管理和線程安全保證"""
+    
+    def __init__(self, encoder_controller):
+        """初始化線程安全的編碼器控制器包裝器
+        
+        Args:
+            encoder_controller: 原始編碼器控制器
+        """
+        self.encoder_controller = encoder_controller
+        self.lock = threading.RLock()
+        
+    def __enter__(self):
+        """上下文管理器進入"""
+        self.lock.acquire()
+        return self.encoder_controller
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器退出"""
+        self.lock.release()
+        
+        # 異常處理和日誌記錄
+        if exc_type is not None:
+            logger.error(f"編碼器操作出錯: {exc_val}")
+            return False  # 不抑制異常
+            
+        return True
+    
+    def __getattr__(self, name):
+        """獲取屬性時自動轉發到編碼器控制器，並確保線程安全"""
+        attr = getattr(self.encoder_controller, name)
+        
+        if callable(attr):
+            # 如果是方法，返回線程安全的包裝
+            def thread_safe_method(*args, **kwargs):
+                with self.lock:
+                    return attr(*args, **kwargs)
+            return thread_safe_method
+        else:
+            # 如果是屬性，直接返回
+            return 

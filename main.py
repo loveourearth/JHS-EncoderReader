@@ -8,8 +8,8 @@ import sys
 import time
 import argparse
 import logging
+import logging.handlers
 import signal
-import threading
 import os
 import asyncio
 
@@ -49,13 +49,24 @@ def setup_logging(debug=False):
     """
     log_level = logging.DEBUG if debug else logging.INFO
     
+    # 讀取配置
+    config = ConfigManager()
+    logging_config = config.get_logging_config()
+    
+    # 設置輪替日誌
+    file_handler = logging.handlers.RotatingFileHandler(
+        logging_config.get('file_path', 'encoder_system.log'),
+        maxBytes=logging_config.get('max_size_mb', 10) * 1024 * 1024,
+        backupCount=logging_config.get('backup_count', 5)
+    )
+    
     # 配置日誌
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("encoder_system.log")
+            file_handler
         ]
     )
     
@@ -154,12 +165,6 @@ async def async_mode():
     global running, controller
     
     try:
-        # 不需要創建新的控制器，使用已經初始化的全局控制器
-        # controller = MainController()  # 刪除這行
-        # if not await controller.initialize_async():  # 刪除這行
-        #     logger.error("系統初始化失敗")
-        #     return 1
-            
         # 創建事件循環
         loop = asyncio.get_event_loop()
         
@@ -179,57 +184,18 @@ async def async_mode():
         try:
             logger.info("系統已啟動（非同步模式），按Ctrl+C停止...")
             
-            # # 定期執行健康檢查
-            # check_task = asyncio.create_task(periodic_health_check(controller, stop_event))
-            
             # 等待停止事件
             await stop_event.wait()
             
-            # # 取消健康檢查任務
-            # check_task.cancel()
-            # try:
-            #     await check_task
-            # except asyncio.CancelledError:
-            #     pass
-                
         finally:
-            # 關閉系統通過全局控制器的關閉方法
-            controller.shutdown()  # 使用同步版本，不需要async版本
+            # 使用異步方式關閉系統
+            await controller.shutdown_async()
             logger.info("系統已關閉（非同步模式）")
             
         return 0
     except Exception as e:
         logger.exception(f"非同步模式運行出錯: {e}")
         return 1
-
-async def periodic_health_check(controller, stop_event):
-    """定期執行系統健康檢查"""
-    while not stop_event.is_set():
-        try:
-            # 檢查各模塊狀態
-            status = controller.get_status()
-            
-            # 檢查編碼器連接狀態（添加更多錯誤處理）
-            if "encoder" in status and "connected" in status["encoder"] and status["encoder"]["connected"] == False:
-                logger.warning("編碼器未連接，嘗試重新連接...")
-                # 嘗試重新連接
-                controller.handle_command({"command": "connect"}, "SYSTEM")
-                
-            # 記錄系統健康狀態
-            encoder_status = status.get("encoder", {}).get("connected", False)
-            gpio_status = status.get("gpio", {}).get("initialized", False)
-            osc_status = status.get("osc", {}).get("running", False)
-            
-            logger.debug(f"系統健康狀態: 編碼器={encoder_status}, GPIO={gpio_status}, OSC={osc_status}")
-                
-        except Exception as e:
-            logger.error(f"健康檢查出錯: {e}")
-            
-        # 等待30秒
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=30)
-        except asyncio.TimeoutError:
-            pass  # 超時正常，繼續下一輪檢查
 
 def handle_monitor_command(args):
     """處理監測命令"""
