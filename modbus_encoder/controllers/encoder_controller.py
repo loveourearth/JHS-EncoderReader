@@ -438,25 +438,34 @@ class EncoderController:
         with self.lock:
             return self.current_lap_count
         
+        
     def get_direction(self) -> int:
         """獲取旋轉方向，基於角速度
         
         Returns:
-            0: 順時針，1: 逆時針
+            1: 正向旋轉 (順時針), 0: 停止, -1: 反向旋轉 (逆時針)
         """
         if not self.connected:
-            return 0  # 未連接時默認為順時針
+            return 0  # 未連接時默認為停止
             
         try:
             success, speed = self.read_speed()
             if success and speed is not None:
-                # 如果角速度為負，表示逆時針旋轉
-                return 1 if speed < 0 else 0
-            return 0  # 讀取失敗時默認為順時針
+                # 定義停止的閾值（例如 1 RPM）
+                stop_threshold = 1.0
+                
+                if abs(speed) < stop_threshold:
+                    return 0  # 停止
+                elif speed > 0:
+                    return 1  # 正向旋轉 (順時針)
+                else:
+                    return -1  # 反向旋轉 (逆時針)
+                    
+            return 0  # 讀取失敗時默認為停止
         except Exception:
-            return 0  # 發生錯誤時默認為順時針
-        
-        
+            return 0  # 發生錯誤時默認為停止
+
+
     def start_monitoring(self, interval: float = 0.5) -> Tuple[bool, Union[Dict[str, Any], str]]:
         """增強的監測啟動方法，添加重試和資源鎖
         

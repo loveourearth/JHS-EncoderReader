@@ -7,6 +7,7 @@
 import os
 import json
 import logging
+import socket
 from typing import Dict, Any, Tuple, List, Optional
 
 # 配置日誌
@@ -60,6 +61,27 @@ DEFAULT_CONFIG = {
         "id": "001"            # 預設設備ID
     }
 }
+
+
+def get_system_hostname() -> str:
+    """獲取系統主機名
+    
+    Returns:
+        系統主機名，若取得失敗則返回None
+    """
+    try:
+        hostname = socket.gethostname()
+        # 處理域名情況 (移除 .local)
+        if '.' in hostname:
+            hostname = hostname.split('.')[0]
+        # 若主機名包含@符號，取其後部分（例如 rpi@rpi301.local → rpi301）
+        if '@' in hostname:
+            hostname = hostname.split('@')[1]
+        return hostname
+    except Exception as e:
+        logger.warning(f"獲取系統主機名出錯: {e}")
+        return None
+
 
 class ConfigManager:
     """配置管理器類
@@ -333,8 +355,22 @@ class ConfigManager:
 
     
     def get_device_name(self) -> str:
-        """獲取設備名稱"""
-        device_config = self.config.get('device', {})
-        name = device_config.get('name', 'encoder-pi')
-        device_id = device_config.get('id', '000')
-        return f"{name}-{device_id}"  # 例如 "encoder-pi-001"
+        """獲取設備名稱，優先使用系統主機名，不附加 ID
+        
+        Returns:
+            設備名稱，直接使用主機名
+        """
+        # 嘗試獲取系統主機名
+        hostname = get_system_hostname()
+        
+        # 如果取得有效的主機名則使用，否則使用配置的名稱
+        if hostname and hostname not in ("localhost", "raspberrypi"):
+            name = hostname
+            logger.info(f"使用系統主機名 '{hostname}' 作為設備名稱")
+        else:
+            # 從配置檔案中獲取設備名稱，不再使用 ID 部分
+            device_config = self.config.get('device', {})
+            name = device_config.get('name', 'encoder-pi')
+            logger.debug(f"使用配置檔案中的設備名稱: '{name}'")
+            
+        return name

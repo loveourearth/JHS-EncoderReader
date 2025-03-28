@@ -20,17 +20,14 @@ class AddressFormatHandler:
         self.config_manager = config_manager
         
     def get_device_name(self) -> str:
-        """獲取設備完整名稱
+        """獲取設備完整名稱，不附加 ID
         
         Returns:
-            設備名稱 (例如 encoder-pi-001)
+            設備名稱
         """
         if self.config_manager:
-            device_config = self.config_manager.config.get('device', {})
-            device_name = device_config.get('name', 'encoder-pi')
-            device_id = device_config.get('id', '001')
-            return f"{device_name}-{device_id}"
-        return "encoder-pi-001"  # 預設值
+            return self.config_manager.get_device_name()
+        return "encoder-pi"  # 預設值
         
     def normalize_address(self, address: str, message_type: Optional[str] = None) -> str:
         """規範化OSC地址格式

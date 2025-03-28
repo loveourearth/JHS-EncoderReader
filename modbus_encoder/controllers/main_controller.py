@@ -68,7 +68,8 @@ class MainController:
             self.running = encoder_success or gpio_success or osc_success
             
             if self.running:
-                logger.info("系統初始化完成")
+                device_name = self.config_manager.get_device_name()
+                logger.info(f"系統初始化完成，設備名稱: {device_name}")
                 return True
             else:
                 logger.error("系統初始化完全失敗，所有子系統都未能啟動")
@@ -676,21 +677,21 @@ class MainController:
         # 使用統一回應處理函數
         return self._send_encoder_response(response, "multi_position")
             
+
     def _handle_read_speed(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
-        """處理讀取速度命令
-        
-        Args:
-            params: 命令參數
-            source: 命令來源
-            
-        Returns:
-            處理結果
-        """
+        """處理讀取速度命令"""
         success, result = self.encoder_controller.read_speed()
         
         if success:
             direction = self.encoder_controller.get_direction()
-            direction_str = "逆時針" if direction == 1 else "順時針"
+            
+            # 更新後的方向文字
+            if direction == 0:
+                direction_str = "停止"
+            elif direction == 1:
+                direction_str = "順時針"  # 正向
+            else:  # direction == -1
+                direction_str = "逆時針"  # 反向
             
             response = {
                 "status": "success",
@@ -1319,16 +1320,13 @@ class MainController:
            
     def _handle_get_device_info(self, params: Dict[str, Any], source: Any) -> Dict[str, Any]:
         """處理獲取設備信息命令"""
-        device_config = self.config_manager.config.get('device', {})
-        device_name = device_config.get('name', 'encoder-pi')
-        device_id = device_config.get('id', '001')
+        device_name = self.config_manager.get_device_name()
         
         return {
             "status": "success",
             "type": "device_info",
-            "device_name": f"{device_name}-{device_id}",
-            "name": device_name,                        
-            "id": device_id,
+            "device_name": device_name,
+            "name": device_name,
             "timestamp": time.time()
         }
     
@@ -1343,14 +1341,11 @@ class MainController:
             return
 
         # 從配置管理器獲取設備名稱
-        device_config = self.config_manager.config.get('device', {})
-        device_name = device_config.get('name', 'encoder-pi')
-        device_id = device_config.get('id', '001')
-        full_device_name = f"{device_name}-{device_id}"
+        device_name = self.config_manager.get_device_name()
 
         # 添加設備名稱到數據中
         if "device_name" not in data:
-            data["device_name"] = full_device_name
+            data["device_name"] = device_name            
             
         # 生成數據指紋用於重複數據檢測
         # 使用角度、速度和圈數作為關鍵數據點
@@ -1603,10 +1598,8 @@ class MainController:
 
         # 添加設備名稱
         if "device_name" not in result:
-            device_config = self.config_manager.config.get('device', {})
-            device_name = device_config.get('name', 'encoder-pi')
-            device_id = device_config.get('id', '001')
-            result["device_name"] = f"{device_name}-{device_id}"
+            device_name = self.config_manager.get_device_name()
+            result["device_name"] = device_name
             
         # 使用 broadcast 發送
         if self.osc_server:
@@ -1631,10 +1624,8 @@ class MainController:
 
         # 添加設備名稱
         if "device_name" not in result:
-            device_config = self.config_manager.config.get('device', {})
-            device_name = device_config.get('name', 'encoder-pi')
-            device_id = device_config.get('id', '001')
-            result["device_name"] = f"{device_name}-{device_id}"
+            device_name = self.config_manager.get_device_name()
+            result["device_name"] = device_name
             
         # 使用 broadcast 發送
         if self.osc_server:

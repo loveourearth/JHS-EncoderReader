@@ -43,9 +43,5 @@
         "retry_interval": 5,
         "auto_reconnect": true,
         "logging_interval": 300
-    },
-    "device": {
-        "name": "encoder-pi",
-        "id": "001"
     }
 }
