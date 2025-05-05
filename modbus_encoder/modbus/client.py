@@ -691,6 +691,14 @@ class ModbusClient:
         """
         return self.read_register(RegisterAddress.ENCODER_MULTI_VALUE)
         
+    def read_encoder_virtual_laps(self) -> Optional[int]:
+        """讀取編碼器虛擬圈數值
+        
+        Returns:
+            編碼器虛擬圈數值，失敗時返回None
+        """
+        return self.read_register(RegisterAddress.ENCODER_VIRTUAL_VALUE)
+        
     def read_encoder_speed(self) -> Optional[float]:
         """讀取編碼器角速度
         

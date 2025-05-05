@@ -296,13 +296,13 @@ class OSCServer:
                     return False
                     
             elif format_type.lower() == "osc":
-                # 使用統一的地址格式
-                if isinstance(data, list):
-                    # 新格式: /{device_name}/encoder/data
+                # 處理新的數據格式 [圈數, 原始角度, 原始轉速]
+                if isinstance(data, list) and len(data) == 3:
                     address = f"/{device_name}/encoder/data"
                     client.send_message(address, data)
                     logger.debug(f"發送OSC數據到: {address}")
-                    
+                    return True
+                
                 elif isinstance(data, dict):
                     if "type" in data and data["type"] == "monitor_data":
                         # 監測數據特殊處理
@@ -506,9 +506,6 @@ class OSCServer:
             self.server_thread.daemon = True
             self.server_thread.start()
             
-            # 啟動心跳線程
-            self._start_heartbeat()
-            
             logger.info(f"OSC服務器已啟動在 {self.host}:{self.port}")
             return True
             
@@ -516,44 +513,6 @@ class OSCServer:
             logger.error(f"啟動OSC服務器出錯: {e}")
             self.running = False
             return False
-
-    def _start_heartbeat(self):
-        """啟動心跳機制以保持連線活躍"""
-        def heartbeat_task():
-            while self.running:
-                try:
-                    # 使用合理的間隔（修改自 240 秒到 120 秒）
-                    time.sleep(self.heartbeat_interval)
-                    if not self.running:  # 重要：確保在等待期間沒有停止運行
-                        break
-                        
-                    # 獲取設備名稱（原有邏輯）
-                    device_info = None
-                    if self.command_handler:
-                        try:
-                            device_info = self.command_handler({"command": "get_device_info"}, None)
-                        except Exception as e:
-                            logger.error(f"獲取設備資訊出錯: {e}")
-                    
-                    # 構建心跳數據（加入更多系統健康資訊）
-                    heartbeat_data = {
-                        "type": "heartbeat",
-                        "timestamp": time.time(),
-                        "device_name": device_info.get("device_name", "unknown") if device_info else "unknown",
-                        "status": "ok"  # 可從 command_handler 獲取更詳細狀態
-                    }
-                    
-                    # 使用統一的地址發送心跳
-                    success_count = self.broadcast("/system/heartbeat", heartbeat_data)
-                    logger.debug(f"已發送心跳包到 {success_count} 個客戶端")
-                except Exception as e:
-                    logger.error(f"心跳任務出錯: {e}")
-                    # 不中斷循環，保證心跳持續運行
-
-        # 啟動心跳線程（保持原有實現）
-        self.heartbeat_thread = threading.Thread(target=heartbeat_task, name="HeartbeatThread")
-        self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
             
     def stop(self):
         """停止OSC服務器"""

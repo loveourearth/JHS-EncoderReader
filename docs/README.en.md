@@ -1,6 +1,6 @@
 # Modbus Encoder Control System (English Version)
 
-A Python-based encoder control system using Modbus-RTU communication protocol to connect to encoder devices, providing GPIO control and OSC network interface. The system is designed with asynchronous mode, supporting connection monitoring, automatic reconnection, and heartbeat mechanisms.
+A Python-based encoder control system using Modbus-RTU communication protocol to connect to encoder devices, providing GPIO control and OSC network interface. The system is designed with asynchronous mode, supporting connection monitoring, automatic reconnection, and data transmission mechanisms.
 
 ## Features
 
@@ -8,7 +8,7 @@ A Python-based encoder control system using Modbus-RTU communication protocol to
 - **GPIO Control**: Control output pins, read input pins, generate pulse signals
 - **OSC Network Interface**: UDP/OSC protocol supporting multiple client connections
 - **Asynchronous Execution**: Efficient I/O operations and resource management
-- **Robust Connection**: Heartbeat mechanism and automatic reconnection ensure stable long-term operation
+- **Robust Connection**: Automatic reconnection ensures stable long-term operation
 - **Smart Monitoring**: Each client establishes only one monitoring task, avoiding resource waste
 
 ## Device Naming Mechanism
@@ -78,8 +78,7 @@ Configure system parameters through the `settings.json` file (note: device secti
         "host": "0.0.0.0",
         "port": 8888,
         "return_port": 9999,
-        "heartbeat_interval": 120,
-        "heartbeat_enabled": true
+        "enabled": true
     }
 }
 ```
@@ -94,22 +93,13 @@ The system uses two different ports for OSC communication:
 **Important**: Clients must be configured to send commands to port 8888 and listen for responses on port 9999.
 In some OSC client libraries, this requires setting different input and output ports.
 
-## Heartbeat Mechanism
-
-The system uses a bidirectional heartbeat mechanism to ensure connection stability:
-
-1. **Server Heartbeat**: The system sends heartbeat messages to all clients at the `/system/heartbeat` address every `heartbeat_interval` seconds (default 120 seconds)
-2. **Client Heartbeat**: Clients should periodically send `/whoami` requests to maintain active connections, recommended every 60-90 seconds
-
-**Important Note**: Client connections inactive for extended periods (over 5 minutes) will be automatically cleaned up by the system. For long-running applications, clients must implement a mechanism to send `/whoami` to maintain the connection.
-
 ## OSC Commands
 
 The system provides the following main commands via UDP/OSC protocol:
 
 ### System Commands
 
-- **/whoami** - Get device identity information (also serves as heartbeat to maintain connection)
+- **/whoami** - Get device identity information
   ```
   /whoami
   ```
@@ -159,20 +149,20 @@ The system provides the following main commands via UDP/OSC protocol:
   /gpio read        # Read input pin state
   ```
 
-## OSC Response Format
+## OSC Response Format (Updated)
 
-The system uses OSC format as the default response format, particularly suitable for real-time control scenarios:
+The system now uses a more concise data format, particularly suitable for high-frequency transmission scenarios:
 
 Monitoring data is sent to address: `/[device-name]/encoder/data`
-Parameter list: [address, timestamp, direction, angle, rpm, laps, raw_angle, raw_rpm]
+Parameter list (three parameters): [laps, raw_angle, raw_rpm]
 
 For example:  
 Address: `/rpi301/encoder/data`  
-Parameters: `[1, 1635423016.789, 0, 180.0, 60.0, 0, 2048, 1024]`
+Parameters: `[5, 2048, 1024]`
 
 If using text format, data is sent space-separated to the `/[device-name]/text` address:
 ```
-1 1635423016.789 0 180.0000 60.0000 0 2048 1024
+5 2048 1024
 ```
 
 ## Smart Monitoring Features
@@ -183,8 +173,6 @@ The system implements the following smart monitoring mechanisms to ensure effici
 2. **Duplicate Data Filtering**: Intelligently detects and filters identical data sent within short time periods, reducing network traffic and system load
 3. **Automatic Resource Management**: When clients disconnect, related monitoring tasks are automatically cleaned up, freeing system resources
 
-These mechanisms collectively ensure the system remains efficient and stable during long-term operation.
-
 ## Command Line Options
 
 - `-d, --debug`: Enable debug mode
@@ -193,3 +181,7 @@ These mechanisms collectively ensure the system remains efficient and stable dur
 - `-a ADDRESS, --address ADDRESS`: Specify slave address
 - `--async-mode`: Run in asynchronous mode (recommended as default)
 - `-c, --command`: Execute a single command and exit
+
+## License
+
+This project is licensed under the MIT License.

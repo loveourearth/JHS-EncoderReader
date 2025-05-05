@@ -380,63 +380,79 @@ class EncoderController:
                 logger.error(f"設置零點出錯: {e}")
                 return False, str(e)
             
+            
     def _update_lap_count(self, current_position: int) -> int:
-        """更新圈數計算
-        
-        基於當前位置與上一次位置的變化計算圈數
+        """在監測過程中更新位置並獲取圈數
         
         Args:
             current_position: 當前編碼器位置
-            
+                
         Returns:
             當前圈數
         """
-        # 此方法已在調用處加鎖，不需要重複鎖定
-        
-        # 如果閾值未設置，使用默認值
-        if self.position_threshold is None:
-            self.position_threshold = 2048  # 默認值，應根據編碼器分辨率調整
-            
-        # 如果這是第一次讀取位置，僅初始化參考值
-        if self.last_position is None:
-            self.last_position = current_position
-            return self.current_lap_count
-            
-        # 計算位置差
-        pos_diff = current_position - self.last_position
-        
-        # 檢測跨越零點
-        if abs(pos_diff) > self.position_threshold:
-            # 從高位到低位 (順時針通過零點)
-            if pos_diff < 0:
-                self.current_lap_count += 1
-                self._trigger_event("on_lap_change", {
-                    "direction": "clockwise",
-                    "laps": self.current_lap_count,
-                    "position": current_position
-                })
-            # 從低位到高位 (逆時針通過零點)
-            else:
-                self.current_lap_count -= 1
-                self._trigger_event("on_lap_change", {
-                    "direction": "counterclockwise",
-                    "laps": self.current_lap_count,
-                    "position": current_position
-                })
-                
-        # 更新參考位置
+        # 更新位置參考
         self.last_position = current_position
         
-        return self.current_lap_count
+        # 使用公共方法獲取圈數
+        laps = self.get_lap_count()
+        
+        # 這裡可以添加任何額外的監測邏輯，如檢測方向變化等
+        
+        return laps
+        
         
     def get_lap_count(self) -> int:
-        """獲取當前圈數
+        """獲取當前圈數，從寄存器直接讀取
         
         Returns:
             當前圈數
         """
-        with self.lock:
-            return self.current_lap_count
+        if not self.connected:
+            return 0
+            
+        try:
+            # 直接從寄存器讀取圈數值
+            success, value = self.read_virtual_laps()
+            if success and value is not None:
+                # 處理為帶符號整數（如需要）
+                if value > 32767:
+                    value = value - 65536
+                # 更新儲存的圈數
+                self.current_lap_count = value
+                return value
+        except Exception as e:
+            logger.error(f"讀取圈數值出錯: {e}")
+        
+        # 讀取失敗時返回儲存的值
+        return self.current_lap_count
+        
+        
+    def read_virtual_laps(self) -> Tuple[bool, Union[int, str]]:
+        """讀取編碼器虛擬圈數值
+        
+        Returns:
+            (成功狀態, 圈數值或錯誤信息)
+        """
+        if not self.connected:
+            return False, "編碼器未連接"
+        
+        with self.lock:   
+            try:
+                laps = self.modbus_client.read_encoder_virtual_laps()
+                if laps is None:
+                    self.consecutive_errors += 1
+                    if self.consecutive_errors > self.max_consecutive_errors:
+                        logger.error(f"連續讀取失敗 {self.consecutive_errors} 次")
+                    return False, "讀取圈數失敗"
+                    
+                # 重置錯誤計數
+                self.consecutive_errors = 0
+                
+                return True, laps
+            except Exception as e:
+                logger.error(f"讀取圈數出錯: {e}")
+                self.consecutive_errors += 1
+                return False, str(e)
         
         
     def get_direction(self) -> int:

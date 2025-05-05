@@ -1347,13 +1347,12 @@ class MainController:
         if "device_name" not in data:
             data["device_name"] = device_name            
             
-        # 生成數據指紋用於重複數據檢測
-        # 使用角度、速度和圈數作為關鍵數據點
-        data_fingerprint = (
-            data.get("angle", 0),
-            data.get("rpm", 0),
-            data.get("laps", 0)
-        )
+        # 修改數據格式為[圈數, 原始角度, 原始轉速]
+        simplified_data = [
+            data.get("laps", 0),             # 圈數
+            data.get("raw_angle", 0),        # 原始角度
+            data.get("raw_rpm", 0) if data.get("raw_rpm") is not None else 0  # 原始轉速
+        ]
 
         # 發送到所有任務目標
         with self.continuous_task_lock:
@@ -1367,63 +1366,14 @@ class MainController:
                     
                 format_type = task_info.get("format", "osc")
                 
-                # 檢查是否為重複數據 (同一任務在短時間內發送相同數據)
-                last_data = task_info.get("last_data")
-                last_sent_time = task_info.get("last_sent_time", 0)
-                current_time = time.time()
-                
-                # 如果是相同數據且時間間隔小於間隔的一半，則跳過發送
-                min_interval = task_info.get("interval", 0.5) / 2
-                if (last_data == data_fingerprint and 
-                    (current_time - last_sent_time) < min_interval):
-                    logger.debug(f"跳過重複數據: 任務={task_id}, 時間間隔={current_time - last_sent_time:.3f}秒")
-                    continue
-                
-                # 根據格式類型發送資料
-                if format_type.lower() == "json":
-                    result = {
-                        "type": "monitor_data",
-                        "task_id": task_id,
-                        "device_name": full_device_name,
-                        "address": data["address"],
-                        "timestamp": data["timestamp"],
-                        "direction": data["direction"],
-                        "angle": data["angle"],
-                        "rpm": data["rpm"],
-                        "laps": data["laps"],
-                        "raw_angle": data["raw_angle"],
-                        "raw_rpm": data["raw_rpm"]
-                    }
-                elif format_type.lower() == "osc":
-                    # OSC 格式 - 使用修改後的格式，設備名稱在地址中
-                    rpm_value = data['rpm'] if data['rpm'] is not None else 0
-                    raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
+                # 根據格式類型發送新的簡化資料
+                if format_type.lower() in ["json", "osc"]:
+                    self.osc_server.broadcast("/encoder/monitor_data", simplified_data)
+                else:  # 文本格式
+                    # 構建空格分隔的文本
+                    text_data = f"{simplified_data[0]} {simplified_data[1]} {simplified_data[2]}\n"
+                    self.osc_server.broadcast("/encoder/monitor_data", text_data)
                     
-                    result = [
-                        data["address"],         # 地址
-                        data["timestamp"],       # 時間戳
-                        data["direction"],       # 方向
-                        data["angle"],           # 角度
-                        rpm_value,               # 轉速
-                        data["laps"],            # 圈數
-                        data["raw_angle"],       # 原始角度
-                        raw_rpm_value            # 原始轉速
-                    ]
-                else:
-                    # 文本格式: 使用空格分隔
-                    rpm_value = data['rpm'] if data['rpm'] is not None else 0
-                    raw_rpm_value = data['raw_rpm'] if data['raw_rpm'] is not None else 0
-                    
-                    result = f"{data['address']} {data['timestamp']:.3f} {data['direction']} {data['angle']:.4f} {rpm_value:.4f} {data['laps']} {data['raw_angle']} {raw_rpm_value}\n"
-
-                # 發送資料
-                if source:
-                    # 廣播到所有客户端
-                    self.osc_server.broadcast("/encoder/monitor_data", result)
-                    
-                    # 更新最後發送的數據和時間
-                    task_info["last_data"] = data_fingerprint
-                    task_info["last_sent_time"] = current_time
                     
     def _on_encoder_zero_set(self, data: Dict[str, Any]) -> None:
         """編碼器零點設置事件處理器
