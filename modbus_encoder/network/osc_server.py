@@ -122,8 +122,10 @@ class OSCServer:
         # 客戶端記錄
         self.clients = {}
         self.last_client_address = None
-        self.heartbeat_interval = 240
-        self.heartbeat_thread = None
+        
+        # 刪除heartbeat相關屬性
+        # self.heartbeat_interval = 240
+        # self.heartbeat_thread = None
         
         # 設置默認處理器
         self.dispatcher.set_default_handler(self._default_handler)
@@ -150,7 +152,9 @@ class OSCServer:
         
         # 停止事件flags
         self.stop_send_event = threading.Event()
-        self.stop_heartbeat_event = threading.Event()
+        
+        # 移除heartbeat相關事件
+        # self.stop_heartbeat_event = threading.Event()
         
         # 啟動發送執行緒
         self._start_send_thread()
@@ -191,8 +195,8 @@ class OSCServer:
                 success = self._send_data(client_address, data, format_type)
                 
                 if not success:
-                    # 發送失敗，可以選擇重新放入隊列或記錄錯誤
-                    logger.error(f"發送消息到 {client_address} 失敗")
+                    # 發送失敗，可以選擇重新放入隊列或記錄錯誤，但不移除客戶端
+                    logger.debug(f"發送消息到 {client_address} 失敗，但保持客戶端連接")
                 
                 # 標記任務完成
                 self.message_queue.task_done()
@@ -205,8 +209,6 @@ class OSCServer:
     
     def _send_data(self, client_address, data, format_type):
         """實際發送數據
-        
-        將數據格式從逗號分隔修改為空格分隔
         
         Args:
             client_address: 客戶端地址
@@ -404,54 +406,33 @@ class OSCServer:
             self.tx_count += 1
             logger.debug(f"成功發送數據到 {client_address}")
             return True
-        except ConnectionRefusedError:
-            # 特別處理連線被拒絕的情況
-            logger.warning(f"連線被拒絕: {client_address}，可能客戶端已關閉")
             
-            # 從客戶端列表中移除
-            self._remove_disconnected_client(client_address)
+        # 修改異常處理，不再移除客戶端
+        except ConnectionRefusedError:
+            # 只記錄，不移除客戶端
+            logger.debug(f"連線被拒絕: {client_address}，客戶端可能暫時不可用，但將保持註冊狀態")
             self.error_count += 1
             return False
         except OSError as e:
-            # 處理網絡相關錯誤
-            logger.error(f"網絡錯誤: {e}")
-            if "No route to host" in str(e) or "Network is unreachable" in str(e):
-                self._remove_disconnected_client(client_address)
+            # 只記錄，不移除客戶端
+            logger.debug(f"網絡錯誤: {e}，客戶端將保持註冊狀態")
             self.error_count += 1
             return False
         except Exception as e:
-            logger.error(f"發送數據出錯: {e}")
+            logger.debug(f"發送數據出錯: {e}，客戶端將保持註冊狀態")
             self.error_count += 1
             return False
 
 
-    def _remove_disconnected_client(self, client_address):
-        """移除已斷開連接的客戶端
+    # 移除客戶端移除方法或修改為僅記錄
+    def _log_disconnected_client(self, client_address):
+        """只記錄客戶端斷開連接信息，但不從客戶端列表中移除
         
         Args:
             client_address: 客戶端地址
         """
-        with self.clients_lock:
-            client_key = f"{client_address[0]}:{client_address[1]}"
-            if client_key in self.clients:
-                logger.info(f"移除無法連線的客戶端: {client_address}")
-                del self.clients[client_key]
-                
-                # 檢查是否有需要通知的其他客戶端
-                if len(self.clients) > 0 and self.running:
-                    # 通知其他客戶端有客戶端斷開
-                    try:
-                        notification = {
-                            "type": "client_disconnected",
-                            "timestamp": time.time(),
-                            "client": client_address[0]
-                        }
-                        # 只向訂閱了系統事件的客戶端發送通知
-                        for ck, client_info in self.clients.items():
-                            if "subscribe" in client_info and "system" in client_info["subscribe"]:
-                                self.send_response(notification, client_info["address"], "json")
-                    except Exception as e:
-                        logger.error(f"發送客戶端斷開通知時出錯: {e}")
+        client_key = f"{client_address[0]}:{client_address[1]}"
+        logger.debug(f"客戶端連接暫時不可用: {client_address}，但將保持註冊狀態")
 
 
     def _encoder_list_monitors_handler(self, address: str, *args) -> None:
@@ -522,18 +503,7 @@ class OSCServer:
         logger.info("正在停止OSC服務器...")
         self.running = False  # 先將運行標誌設為 False
 
-        # 先設置心跳停止事件，讓心跳線程能更快終止
-        self.stop_heartbeat_event.set()
-        
-        # 停止心跳線程
-        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            try:
-                logger.debug("等待心跳線程終止...")
-                self.heartbeat_thread.join(timeout=2.0)
-                if self.heartbeat_thread.is_alive():
-                    logger.warning("心跳線程無法在 2 秒內終止，繼續執行")
-            except Exception as e:
-                logger.error(f"等待心跳線程終止時出錯: {e}")
+        # 移除heartbeat相關代碼
         
         # 停止發送線程
         if self.send_thread and self.send_thread.is_alive():
@@ -1224,25 +1194,54 @@ class OSCServer:
                 }
                 logger.debug(f"新客戶端連接: {client_address}")
             
-            # 清理過期客戶端
-            self._cleanup_clients()
+            # 移除客戶端清理邏輯，以實現長連接
         
-    def _cleanup_clients(self) -> None:
-        """清理過期客戶端"""
-        current_time = time.time()
-        expired_time = 900
+    def broadcast(self, address: str, data: Any) -> int:
+        """廣播消息給所有客戶端，長連接版本
         
-        expired_keys = []
-        for client_key, client_info in self.clients.items():
-            if current_time - client_info["last_seen"] > expired_time:
-                expired_keys.append(client_key)
+        Args:
+            address: OSC地址
+            data: 要發送的數據
                 
-        for key in expired_keys:
-            client_info = self.clients[key]
-            logger.debug(f"清理過期客戶端: {client_info['address']}")
-            del self.clients[key]
-            
-                
+        Returns:
+            成功發送的客戶端數量
+        """
+        success_count = 0
+
+        with self.clients_lock:  # 使用鎖保護
+            # 遍歷所有客戶端，保留所有客戶端不考慮過期時間
+            for client_key, client_info in list(self.clients.items()):
+                # 發送數據
+                try:
+                    # 獲取原始客戶端地址並修改端口為返回端口
+                    client_addr = client_info["address"]
+                    client_addr = (client_addr[0], self.return_port)
+                    
+                    # 使用_send_data統一處理發送邏輯
+                    if self._send_data(client_addr, data, 
+                                    client_info.get("format", "json")):
+                        success_count += 1
+                    # 即使發送失敗，也不移除客戶端
+                except Exception as e:
+                    logger.debug(f"廣播消息出錯: {e}，客戶端保持註冊狀態")
+                    self.error_count += 1
+
+        return success_count
+
+
+    def get_statistics(self) -> Dict[str, int]:
+        """獲取統計信息
+        
+        Returns:
+            統計信息字典
+        """
+        return {
+            "rx_count": self.rx_count,
+            "tx_count": self.tx_count,
+            "error_count": self.error_count,
+            "active_clients": len(self.clients)
+        }
+
     def send_response(self, data: Any, client_address: Optional[Tuple[str, int]] = None, 
                     format_type: str = "osc") -> bool:
         """發送回應給客戶端
@@ -1276,71 +1275,6 @@ class OSCServer:
         self.message_queue.put((client_address, data, format_type))
         return True
     
-
-    def broadcast(self, address: str, data: Any) -> int:
-        """廣播消息給所有客戶端，增強版
-        
-        Args:
-            address: OSC地址
-            data: 要發送的數據
-                
-        Returns:
-            成功發送的客戶端數量
-        """
-        success_count = 0
-        failed_clients = []
-        current_time = time.time()
-        expired_time = 300  # 5分鐘無活動視為過期
-
-        with self.clients_lock:  # 使用鎖保護
-            # 遍歷所有客戶端
-            for client_key, client_info in list(self.clients.items()):
-                # 檢查是否過期
-                if current_time - client_info["last_seen"] > expired_time:
-                    logger.debug(f"移除過期客戶端: {client_info['address']}")
-                    failed_clients.append(client_key)
-                    continue
-
-                # 發送數據
-                try:
-                    # 獲取原始客戶端地址並修改端口為返回端口
-                    client_addr = client_info["address"]
-                    client_addr = (client_addr[0], self.return_port)
-                    
-                    # 使用_send_data統一處理發送邏輯
-                    if self._send_data(client_addr, data, 
-                                    client_info.get("format", "json")):
-                        success_count += 1
-                    else:
-                        # 如果發送失敗，記錄失敗的客戶端
-                        failed_clients.append(client_key)
-                except Exception as e:
-                    logger.error(f"廣播消息出錯: {e}")
-                    self.error_count += 1
-                    failed_clients.append(client_key)
-            
-            # 移除失敗的客戶端
-            for client_key in failed_clients:
-                if client_key in self.clients:
-                    logger.info(f"從廣播中移除失敗的客戶端: {client_key}")
-                    del self.clients[client_key]
-
-        return success_count
-
-
-    def get_statistics(self) -> Dict[str, int]:
-        """獲取統計信息
-        
-        Returns:
-            統計信息字典
-        """
-        return {
-            "rx_count": self.rx_count,
-            "tx_count": self.tx_count,
-            "error_count": self.error_count,
-            "active_clients": len(self.clients)
-        }
-
     def __enter__(self):
         """上下文管理器進入"""
         self.start()
